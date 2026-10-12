@@ -1,0 +1,80 @@
+{
+  "name": "archipelago-controller",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "A desktop session builder and host controller for Archipelago.",
+  "author": "Archipelago Controller contributors",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && node scripts/run-electron.cjs . --dev\"",
+    "build": "tsc -b && vite build",
+    "package": "npm run build && electron-builder --dir",
+    "release": "npm run build && electron-builder --win nsis portable --x64 --publish never",
+    "release:portable": "npm run build && electron-builder --win portable --x64 --publish never",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "desktop": "node scripts/run-electron.cjs ."
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "fflate": "^0.8.3",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "yaml": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "concurrently": "latest",
+    "electron": "latest",
+    "electron-builder": "^26.15.3",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "latest",
+    "wait-on": "latest"
+  },
+  "build": {
+    "appId": "io.archipelago.controller",
+    "productName": "Archipelago Controller",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-${arch}-setup.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Archipelago Controller"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-${arch}-portable.${ext}"
+    }
+  }
+}
