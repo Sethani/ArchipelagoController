@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 
 type PickedYaml = { path: string; name: string; content: string };
-type ProcessResult = { ok: boolean; exitCode?: number; error?: string | null; outputPath?: string };
+type ProcessResult = { ok: boolean; exitCode?: number; error?: string | null; outputPath?: string; artifactPath?: string; roomId?: string; port?: number };
 
 interface Window {
   archipelago?: {
@@ -9,6 +9,9 @@ interface Window {
     readYamlDirectory(path: string): Promise<PickedYaml[]>;
     pickDirectory(title: string): Promise<string | null>;
     pickExecutable(title: string): Promise<string | null>;
+    pickLaunchFile(title: string): Promise<string | null>;
+    pickLaunchShortcut(): Promise<{ action: import('./types').GameLaunchAction; name: string } | null>;
+    pickSteamSourceMod(): Promise<{ path: string; appId: string; title: string } | null>;
     pickApWorld(): Promise<string | null>;
     exportYaml(payload: { fileName: string; content: string }): Promise<{ ok: boolean; canceled?: boolean; path?: string }>;
     exportYamlPack(payload: { files: Array<{ name: string; content: string }> }): Promise<{ ok: boolean; canceled?: boolean; paths: string[] }>;
@@ -18,7 +21,7 @@ interface Window {
     inventoryTools(installRoot: string): Promise<{
       programs: Array<{ name: string; path: string }>;
       worlds: Array<{ name: string; path: string }>;
-      components: Array<{ displayName: string; type: string; sourceWorld: string; origin: 'custom' | 'built-in' }>;
+      components: Array<{ displayName: string; type: string; sourceWorld: string; origin: 'custom' | 'built-in'; supportsUri: boolean; gameNames: string[] }>;
     }>;
     checkArchipelagoUpdate(payload: { installRoot: string; force?: boolean }): Promise<import('./types').ArchipelagoUpdateStatus>;
     readHostConfig(installRoot: string): Promise<{ ok: boolean; document?: Record<string, unknown>; comments?: Record<string, string>; sourcePath?: string; error?: string }>;
@@ -35,6 +38,29 @@ interface Window {
     launchTool(path: string): Promise<{ ok: boolean; error?: string }>;
     launchApWorldComponent(payload: { installRoot: string; displayName: string }): Promise<{ ok: boolean; error?: string }>;
     openPatch(installRoot: string): Promise<{ ok: boolean; canceled?: boolean; error?: string }>;
+    inspectRoom(payload: { url: string; wake?: boolean }): Promise<({ ok?: true; roomId: string; url: string; provider?: import('./types').RoomProviderDescriptor; trackerId?: string; lastPort?: number; endpoint?: import('./types').RoomEndpoint; lastActivity?: string; timeout?: number; refreshedAt: string; stale: boolean; slots: Array<{ slot: number; name: string; game: string; downloadAvailable: boolean }> }) | { ok: false; error: string }>;
+    takeRoomInvite(): Promise<string | null>;
+    ensureRoom(payload: { roomsRoot: string; label: string; roomId: string }): Promise<{ ok?: true; folderPath?: string; error?: string }>;
+    adoptLocalRoom(payload: { roomsRoot: string; roomId: string; label: string; sessionPath: string; artifactPath?: string; slots: Array<{ slot?: number; name: string; game: string }> }): Promise<{ ok?: true; folderPath?: string; slots?: import('./types').ManagedRoomSlot[]; unresolved?: string[]; error?: string }>;
+    listRoomFiles(payload: { roomsRoot: string; folderPath: string; slot: number; slotName: string }): Promise<{ ok?: true; downloads?: import('./types').RoomFile[]; play?: import('./types').RoomFile[]; error?: string }>;
+    downloadRoomSlot(payload: { roomsRoot: string; folderPath: string; roomUrl: string; provider?: import('./types').RoomProviderDescriptor; slot: number; slotName: string }): Promise<import('./types').RoomFile[] | { ok: false; error: string }>;
+    importRoomFile(payload: { roomsRoot: string; folderPath: string; slot: number; slotName: string }): Promise<{ ok?: true; canceled?: boolean; files?: import('./types').RoomFile[]; error?: string }>;
+    launchRoomFile(payload: { installRoot: string; roomsRoot: string; folderPath: string; roomUrl: string; provider?: import('./types').RoomProviderDescriptor; roomId?: string; slot: number; slotName: string; game: string; sourcePath: string; sourceFileId?: string; passwordRef?: string; autoConnect: boolean }): Promise<{ ok?: true; file?: import('./types').RoomFile; playFolder?: string; patched?: boolean; warnings?: string[]; status?: import('./types').RoomStatusSnapshot; capability?: import('./types').RoomLaunchCapability; error?: string }>;
+    launchRoomClient(payload: { installRoot: string; roomUrl: string; provider?: import('./types').RoomProviderDescriptor; roomId?: string; slotName: string; game: string; passwordRef?: string }): Promise<{ ok?: true; status?: import('./types').RoomStatusSnapshot; capability?: import('./types').RoomLaunchCapability; error?: string }>;
+    openRoomTracker(payload: { roomUrl: string; provider?: import('./types').RoomProviderDescriptor; trackerId: string; slot?: number }): Promise<{ ok?: true; url?: string; error?: string }>;
+    openRoomSphereTracker(payload: { roomUrl: string; provider?: import('./types').RoomProviderDescriptor; trackerId: string }): Promise<{ ok?: true; url?: string; error?: string }>;
+    getRoomTrackerDashboard(payload: { roomId?: string; roomUrl: string; provider?: import('./types').RoomProviderDescriptor; trackerId: string; slots: import('./types').ManagedRoomSlot[] }): Promise<(import('./types').RoomTrackerDashboard & { ok?: true }) | { ok: false; error: string }>;
+    launchRoomUniversalTracker(payload: { installRoot: string; roomUrl: string; provider?: import('./types').RoomProviderDescriptor; roomId: string; slotName: string; game: string; passwordRef?: string; yamlContent?: string }): Promise<{ ok?: true; status?: import('./types').RoomStatusSnapshot; error?: string }>;
+    analyzeRoomUniversalTracker(payload: { installRoot: string; roomUrl: string; provider?: import('./types').RoomProviderDescriptor; roomId: string; slotName: string; game: string; passwordRef?: string; yamlContent?: string }): Promise<(import('./types').RoomLogicAnalysis & { ok?: true }) | { ok: false; error: string }>;
+    inventoryPopTracker(executablePath: string): Promise<{ ok?: true; packs?: import('./types').PopTrackerPack[]; errors?: string[]; error?: string }>;
+    inventoryMinecraftLauncher(): Promise<import('./types').MinecraftLauncherInventory>;
+    launchRoomPopTracker(payload: { executablePath: string; roomUrl: string; provider?: import('./types').RoomProviderDescriptor; roomId?: string; slotName: string; passwordRef?: string; packUid: string; variant: string }): Promise<{ ok?: true; status?: import('./types').RoomStatusSnapshot; pack?: { uid: string; name: string; version: string }; variant?: string; error?: string }>;
+    launchRoomProfile(payload: { roomUrl: string; provider?: import('./types').RoomProviderDescriptor; roomId?: string; roomsRoot: string; roomFolder: string; slotName: string; game: string; selectedFile?: string; profile: import('./types').GameLaunchProfile; stage?: 'all' | 'primary' | 'companion' }): Promise<{ ok?: true; status?: import('./types').RoomStatusSnapshot; launched?: string[]; deferred?: boolean; error?: string }>;
+    startRoomSharing(payload: { roomsRoot: string; roomId: string; label: string; folderPath: string; slots: import('./types').ManagedRoomSlot[]; sharedSlots: number[]; hosted: import('./types').HostedRoomConfig; createdAt: string; passwordRequired: boolean; gateway: import('./types').RoomGatewayConfig }): Promise<Partial<import('./types').RoomShareStatus> & { ok?: true; advertisedHost?: string; mappingMethod?: string; error?: string }>;
+    stopRoomSharing(payload: { roomId: string }): Promise<Partial<import('./types').RoomShareStatus> & { ok?: true; error?: string }>;
+    copyRoomInvite(payload: { roomId: string; kind: 'browser' | 'controller' }): Promise<{ ok?: true; copied?: boolean; error?: string }>;
+    openRoomShare(payload: { roomId: string }): Promise<{ ok?: true; opened?: boolean; error?: string }>;
+    roomShareStatus(): Promise<Partial<import('./types').RoomShareStatus> & { roomId?: string }>;
     saveLibraryFiles(payload: unknown): Promise<string[]>;
     scanExistingHistory(payload: unknown): Promise<Array<{
       importKey: string; name: string; createdAt: string; outputPath: string; artifactPath: string; savePath: string | null;
@@ -43,7 +69,7 @@ interface Window {
     generate(payload: unknown): Promise<ProcessResult>;
     dryRun(payload: unknown): Promise<ProcessResult>;
     host(payload: unknown): Promise<ProcessResult>;
-    hostStatus(): Promise<{ running: boolean; pid: number | null }>;
+    hostStatus(): Promise<{ running: boolean; pid: number | null; roomId?: string | null; port?: number; savePath?: string | null }>;
     sendHostInput(value: string): Promise<{ ok: boolean; error?: string }>;
     stopHost(): Promise<{ ok: boolean; running: boolean }>;
     setSecret(payload: { id: string; value: string }): Promise<{ ok: boolean; configured: boolean }>;
@@ -54,9 +80,11 @@ interface Window {
     sendRemoteInput(value: string): Promise<{ ok: boolean; error?: string }>;
     remoteAdminLogin(secretRef: string): Promise<{ ok: boolean; error?: string }>;
     onLog(callback: (value: string) => void): () => void;
-    onHostStatus(callback: (value: { running: boolean; pid?: number; exitCode?: number; error?: string }) => void): () => void;
+    onHostStatus(callback: (value: { running: boolean; pid?: number; roomId?: string | null; port?: number; savePath?: string | null; exitCode?: number; error?: string }) => void): () => void;
     onConsoleEvent(callback: (value: import('./types').ConsoleEvent) => void): () => void;
     onRemoteStatus(callback: (value: { state: import('./types').ConsoleConnectionState; detail?: string }) => void): () => void;
+    onRoomShareStatus(callback: (value: Partial<import('./types').RoomShareStatus> & { roomId?: string }) => void): () => void;
+    onRoomInvite(callback: (value: string) => void): () => void;
     onYamlValidationProgress(callback: (value: import('./types').ApYamlValidationProgress) => void): () => void;
   };
 }

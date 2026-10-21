@@ -255,13 +255,16 @@ function createYamlValidator({ resolveGames, onBusy = () => {}, run = runGenerat
                 await fs.writeFile(path.join(input, `${String(fileIndex + 1).padStart(3, '0')}-${safeName}.yaml`), templates[fileIndex].content, 'utf8');
               }
               const seed = BigInt(`0x${contextFingerprint.slice(0, 14)}`).toString();
+              if (state.cancelled) return { exitCode: null, output: '', durationMs: 0, cancelled: true };
               return run(generator, ['--player_files_path', input, '--outputpath', output, '--multi', String(templates.length), '--seed', seed, '--skip_output'], installRoot, state);
             })();
             processResult = await contextRun;
           } else {
             await fs.writeFile(path.join(input, 'Player.yaml'), template.content, 'utf8');
             const seed = BigInt(`0x${yamlFingerprint(template.content).slice(0, 14)}`).toString();
-            processResult = await run(generator, ['--player_files_path', input, '--outputpath', output, '--multi', '1', '--seed', seed, '--skip_output'], installRoot, state);
+            processResult = state.cancelled
+              ? { exitCode: null, output: '', durationMs: 0, cancelled: true }
+              : await run(generator, ['--player_files_path', input, '--outputpath', output, '--multi', '1', '--seed', seed, '--skip_output'], installRoot, state);
           }
           const cleanOutput = sanitizeOutput(`${processResult.output}${processResult.error ? `\n${processResult.error}` : ''}`, root, installRoot);
           let status = processResult.timedOut ? 'Timed out' : processResult.cancelled ? 'Cancelled' : processResult.exitCode === 0 ? 'Valid' : classifyFailure(cleanOutput);

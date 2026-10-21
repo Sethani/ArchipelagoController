@@ -1,25 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive, ArrowRightLeft, BookOpen, Check, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, CircleX, Clipboard,
-  Clock3, Copy, Download, ExternalLink, FileCode2, FilePlus2, FolderOpen, Gamepad2, History,
-  Library, ListChecks, LoaderCircle, Menu, PackageSearch, Play, Plus, RefreshCcw, Rocket, Save, Search,
+  Clock3, Copy, Download, ExternalLink, FileCode2, FilePlus2, FolderOpen, Gamepad2, Globe2, History,
+  Library, Link, ListChecks, LoaderCircle, Menu, PackageSearch, Play, Plus, RefreshCcw, Rocket, Save, Search,
   LockKeyhole, Send, Server, Settings as SettingsIcon, SlidersHorizontal, Square, TerminalSquare, Trash2, UserRound, UsersRound, WandSparkles, Wrench,
   X,
 } from 'lucide-react';
-import type { ApWorldMatchResult, ApYamlValidationProgress, ApYamlValidationStatus, AppState, ArchipelagoUpdateStatus, ConsoleConnectionState, ConsoleEvent, HistoryRun, Player, RemoteProfile, SessionPreset, SlotLockControllerConfig, Template, View } from './types';
+import type { ApWorldMatchResult, ApYamlValidationProgress, ApYamlValidationStatus, AppState, ArchipelagoUpdateStatus, ConsoleConnectionState, ConsoleEvent, HistoryRun, ManagedRoom, Player, RemoteProfile, SessionPreset, SlotLockControllerConfig, Template, View } from './types';
 import { compactGameName, contentWithSlotName, exportedYamlName, hostYaml, inspectYaml, prepareTemplates, suggestedFileName, validateRawHostYaml, validationFingerprint, yamlFingerprint } from './lib/session';
 import { initialState, loadLegacyHostPassword, loadState, saveState } from './lib/storage';
-import { mainRelativeSettings, resolveMainPath, tokenizeMainPath } from './lib/paths';
+import { mainRelativeSettings, resolveMainPath, resolveStoragePath, tokenizeMainPath } from './lib/paths';
 import { ApWorldsView } from './ApWorldsView';
 import { findGameHostSections, GameSettingsDialog, ServerSettingsView } from './ServerSettingsView';
 import type { GameSettingsTarget } from './ServerSettingsView';
 import { buildSlotLockTargetGroups, createSlotLockConfig, createSlotLockTemplate, hydrateSlotLockOptions } from './lib/slotlock';
+import { RoomsView } from './RoomsView';
 
 const navItems: { id: View; label: string; icon: typeof Rocket }[] = [
   { id: 'build', label: 'Session Build', icon: Rocket },
   { id: 'library', label: 'Template Library', icon: Library },
   { id: 'roster', label: 'Player Roster', icon: UsersRound },
   { id: 'history', label: 'History', icon: History },
+  { id: 'rooms', label: 'Rooms', icon: Link },
   { id: 'server', label: 'Server Settings', icon: SlidersHorizontal },
   { id: 'apworlds', label: 'APWorlds', icon: PackageSearch },
   { id: 'tools', label: 'Tools', icon: Wrench },
@@ -29,6 +31,12 @@ const navItems: { id: View; label: string; icon: typeof Rocket }[] = [
 const formatDate = (value?: string) => value ? new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) : 'Never';
 const electronReady = Boolean(window.archipelago);
 const installedProgram = (root: string, name: string) => `${root.replace(/[\\/]$/, '')}\\${name}`;
+const clamp = (value: number, minimum: number, maximum: number) => Math.min(maximum, Math.max(minimum, value));
+
+function savedLayoutNumber(key: string, fallback: number): number {
+  const value = Number(localStorage.getItem(key));
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
 
 function templateValidationStatus(template: Template, contextFingerprint?: string): ApYamlValidationStatus | 'Stale' {
   if (!template.apValidation) return 'Not checked';
@@ -66,12 +74,15 @@ export function App() {
   const [search, setSearch] = useState('');
   const [logs, setLogs] = useState<string[]>(['Controller ready. Configure Archipelago paths in Settings.']);
   const [logsOpen, setLogsOpen] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(() => savedLayoutNumber('archipelago-controller-sidebar-width', 218));
+  const [consoleHeight, setConsoleHeight] = useState(() => savedLayoutNumber('archipelago-controller-console-height', 348));
   const [running, setRunning] = useState<'idle' | 'validating' | 'generating' | 'hosting'>('idle');
   const [missingTemplateIds, setMissingTemplateIds] = useState<string[]>([]);
   const [generatorExists, setGeneratorExists] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [toast, setToast] = useState('');
   const [hostRunning, setHostRunning] = useState(false);
+  const [activeHostRoomId, setActiveHostRoomId] = useState<string>();
   const [consoleEvents, setConsoleEvents] = useState<ConsoleEvent[]>([]);
   const [remoteState, setRemoteState] = useState<ConsoleConnectionState>('disconnected');
   const [validationProgress, setValidationProgress] = useState<ApYamlValidationProgress>();
@@ -81,6 +92,7 @@ export function App() {
   const [gameSettingsTarget, setGameSettingsTarget] = useState<GameSettingsTarget>();
   const [slotLockWorldMatch, setSlotLockWorldMatch] = useState<ApWorldMatchResult>();
   const legacyPassword = useRef(loadLegacyHostPassword());
+  const viewContentRef = useRef<HTMLDivElement>(null);
   const initialImportStarted = useRef(false);
   const initialHistoryScanStarted = useRef(false);
   const resolvedPaths = useMemo(() => ({
@@ -88,16 +100,44 @@ export function App() {
     hostedSessionsPath: resolveMainPath(state.settings.hostedSessionsPath, state.settings.installRoot),
     libraryPath: resolveMainPath(state.settings.libraryPath, state.settings.installRoot),
     outputRoot: resolveMainPath(state.settings.outputRoot, state.settings.installRoot),
-  }), [state.settings.installRoot, state.settings.importSource, state.settings.hostedSessionsPath, state.settings.libraryPath, state.settings.outputRoot]);
+    roomsRoot: resolveStoragePath(state.settings.roomsRoot, state.settings.installRoot, state.settings.hostedSessionsPath),
+  }), [state.settings.installRoot, state.settings.importSource, state.settings.hostedSessionsPath, state.settings.libraryPath, state.settings.outputRoot, state.settings.roomsRoot]);
 
   useEffect(() => saveState(state), [state]);
+  useEffect(() => localStorage.setItem('archipelago-controller-sidebar-width', String(sidebarWidth)), [sidebarWidth]);
+  useEffect(() => localStorage.setItem('archipelago-controller-console-height', String(consoleHeight)), [consoleHeight]);
+  useEffect(() => { viewContentRef.current?.scrollTo({ top: 0, left: 0 }); }, [view]);
+
+  const resizeSidebar = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (window.innerWidth <= 1100) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sidebarWidth;
+    const move = (next: PointerEvent) => setSidebarWidth(clamp(startWidth + next.clientX - startX, 176, Math.min(360, window.innerWidth - 560)));
+    const stop = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop); document.body.classList.remove('resizing-layout'); };
+    document.body.classList.add('resizing-layout');
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop, { once: true });
+  };
+
+  const resizeConsole = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = consoleHeight;
+    const move = (next: PointerEvent) => setConsoleHeight(clamp(startHeight + startY - next.clientY, 190, Math.max(190, window.innerHeight - 150)));
+    const stop = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop); document.body.classList.remove('resizing-layout'); };
+    document.body.classList.add('resizing-layout');
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop, { once: true });
+  };
   useEffect(() => window.archipelago?.onLog((value) => setLogs((current) => [...current, ...value.trim().split(/\r?\n/).filter(Boolean)])), []);
   useEffect(() => {
     const bridge = window.archipelago;
     if (!bridge?.hostStatus || !bridge.onHostStatus) return;
-    void bridge.hostStatus().then((status) => setHostRunning(status.running));
+    void bridge.hostStatus().then((status) => { setHostRunning(status.running); setActiveHostRoomId(status.roomId ?? undefined); });
     return bridge.onHostStatus((status) => {
       setHostRunning(status.running);
+      setActiveHostRoomId(status.running ? status.roomId ?? undefined : undefined);
       if (!status.running) setLogs((current) => [...current, status.error ? `Host stopped: ${status.error}` : 'Local host stopped.']);
     });
   }, []);
@@ -419,24 +459,68 @@ export function App() {
       playerCount, slotCount: sessionPrepared.length, games: [...new Set(sessionPrepared.map((item) => item.game))],
       slots: sessionPrepared.map((item) => ({ game: item.game, name: item.resolvedSlotName, originalName: item.sourceSlotName })),
       outputPath: result.outputPath ?? '', status: result.ok ? 'generated' : 'failed', notes: state.sessionNotes,
+      artifactPath: result.artifactPath,
       host: state.host, logs: [...logs, result.ok ? 'Generation complete.' : `Generation failed: ${result.error}`],
       slotLockControllers: state.slotLockControllers.map((config) => ({ ...config, excludedTemplateIds: [...config.excludedTemplateIds], options: { ...config.options } })),
     };
+    const localRoom = result.ok ? await buildLocalRoom(run) : undefined;
     setState((current) => ({
       ...current,
       templates: current.templates.map((item) => current.selectedIds.includes(item.id) || adoptedSlotLockSourceIds.has(item.id) ? { ...item, lastUsed: now } : item),
       history: [run, ...current.history],
+      rooms: localRoom ? [localRoom, ...current.rooms.filter((room) => room.id !== localRoom.id)] : current.rooms,
     }));
     setLogs((current) => [...current, result.ok ? `Generation complete: ${result.outputPath}` : `Generation failed: ${result.error}`]);
     setRunning('idle');
   }
 
-  async function hostLatest(run?: HistoryRun) {
+  async function buildLocalRoom(run: HistoryRun): Promise<ManagedRoom | undefined> {
+    if (!window.archipelago || !run.outputPath || !run.slots?.length) return undefined;
+    const existing = state.rooms.find((room) => room.provider?.type === 'local' && room.provider.historyRunId === run.id);
+    if (existing) return existing;
+    const roomId = `local-${crypto.randomUUID()}`;
+    const adopted = await window.archipelago.adoptLocalRoom({
+      roomsRoot: resolvedPaths.roomsRoot, roomId, label: run.name, sessionPath: run.outputPath,
+      artifactPath: run.artifactPath, slots: run.slots.map((slot, index) => ({ ...slot, slot: index + 1 })),
+    });
+    if (!adopted.folderPath || !adopted.slots) { notify(adopted.error ?? 'Could not create the local room'); return undefined; }
+    if (adopted.unresolved?.length) setLogs((current) => [...current, `${adopted.unresolved!.length} generated file${adopted.unresolved!.length === 1 ? '' : 's'} could not be assigned to a room slot.`]);
+    return {
+      id: roomId, label: run.name, url: `local://room/${roomId}`, folderPath: adopted.folderPath,
+      createdAt: new Date().toISOString(), passwordRef: run.host.roomPasswordRef, passwordSet: run.host.roomPasswordSet,
+      autoLoginWarningAccepted: false, provider: { type: 'local', historyRunId: run.id }, slots: adopted.slots,
+      status: { lastPort: run.host.port, endpoint: { host: 'localhost', port: run.host.port, secure: false }, refreshedAt: new Date().toISOString(), stale: false },
+      hosted: {
+        historyRunId: run.id, sessionPath: run.outputPath, artifactPath: run.artifactPath, savePath: run.savePath,
+        advertisedHost: '', gamePort: run.host.port || 38281, portalPort: run.host.port === 65535 ? 38282 : (run.host.port || 38281) + 1,
+        publicBaseUrl: '', automaticPortMapping: true, insecureHttpAccepted: false,
+        sharedSlots: adopted.slots.filter((slot) => slot.downloadAvailable).map((slot) => slot.slot),
+        shareStatus: { state: 'offline', serverRunning: false, portalRunning: false, mapping: 'unknown', reachability: 'unknown' },
+      },
+    };
+  }
+
+  async function adoptHistoryRoom(run: HistoryRun) {
+    const room = await buildLocalRoom(run);
+    if (!room) return;
+    setState((current) => ({ ...current, rooms: [room, ...current.rooms.filter((item) => item.id !== room.id)] }));
+    setView('rooms');
+    notify('Local room created');
+  }
+
+  async function hostLatest(run?: HistoryRun, roomId?: string) {
     const target = run ?? state.history.find((item) => item.status === 'generated');
     if (!target || !window.archipelago) return;
     setRunning('hosting');
     if (remoteState !== 'disconnected') { notify('Disconnect the remote console before starting a local host'); return; }
-    const result = await window.archipelago.host({ installRoot: state.settings.installRoot, sessionPath: target.outputPath, artifactPath: target.artifactPath, savePath: target.savePath, hostSettings: target.host });
+    const localRoom = roomId ? state.rooms.find((room) => room.id === roomId) : undefined;
+    const hostSettings = localRoom?.hosted ? {
+      ...target.host,
+      host: state.settings.roomGatewayMode === 'managed' ? 'localhost' : target.host.host,
+      port: localRoom.hosted.gamePort,
+    } : target.host;
+    const trackerSlots = localRoom?.slots ?? (target.slots ?? []).map((slot, index) => ({ ...slot, slot: index + 1 }));
+    const result = await window.archipelago.host({ roomId, installRoot: state.settings.installRoot, sessionPath: target.outputPath, artifactPath: target.artifactPath, savePath: target.savePath, hostSettings, slots: trackerSlots });
     setLogs((current) => [...current, result.ok ? `Local host started for ${target.name}.` : `Host failed: ${result.error}`]);
     const slotSummary = target.slots?.map((slot) => `${slot.game}: ${slot.name}`).join(' | ');
     if (result.ok && slotSummary) setConsoleEvents((current) => [...current, { target: 'local', level: 'info', text: `Connection slots: ${slotSummary}`, timestamp: new Date().toISOString() }]);
@@ -509,6 +593,13 @@ export function App() {
     notify('Preset loaded');
   }
 
+  async function connectRoomConsole(profile: RemoteProfile) {
+    const result = await window.archipelago?.connectRemote(profile);
+    if (!result?.ok) { notify(result?.error ?? 'Room console connection failed'); return; }
+    setLogsOpen(true);
+    notify(`Connecting to ${profile.label} as ${profile.slotName}`);
+  }
+
   const content = view === 'build' ? (
     <SessionBuild state={state} patchState={patchState} selected={selected} prepared={prepared} sessionPrepared={sessionPrepared} slotLockWorldMatch={slotLockWorldMatch} search={search} setSearch={setSearch}
       toggleTemplate={toggleTemplate} importYaml={importYaml} readiness={readiness} ready={ready} running={running} generate={generate}
@@ -518,7 +609,9 @@ export function App() {
   ) : view === 'roster' ? (
     <Roster players={state.players} templates={state.templates} selectedIds={state.selectedIds} setPlayers={(players) => patchState({ players })} assignTemplate={assignTemplate} toggleTemplate={togglePlayerTemplate} selectPlayerTemplates={selectPlayerTemplates} exportTemplate={exportPlayerTemplate} exportPack={exportPlayerPack} />
   ) : view === 'history' ? (
-    <HistoryView history={state.history} cloneRun={cloneRun} hostRun={hostLatest} reveal={(path) => window.archipelago?.reveal(path)} openBuild={() => setView('build')} refreshHistory={() => importExistingHistory()} />
+    <HistoryView history={state.history} rooms={state.rooms} cloneRun={cloneRun} hostRun={hostLatest} adoptRoom={(run) => void adoptHistoryRoom(run)} reveal={(path) => window.archipelago?.reveal(path)} openBuild={() => setView('build')} refreshHistory={() => importExistingHistory()} />
+  ) : view === 'rooms' ? (
+    <RoomsView rooms={state.rooms} history={state.history} templates={state.templates} settings={state.settings} roomsRoot={resolvedPaths.roomsRoot} setRooms={(rooms) => patchState({ rooms })} notify={notify} connectConsole={connectRoomConsole} associations={state.popTrackerAssociations} setAssociations={(popTrackerAssociations) => patchState({ popTrackerAssociations })} launchProfiles={state.gameLaunchProfiles} setLaunchProfiles={(gameLaunchProfiles) => patchState({ gameLaunchProfiles })} hostRunning={hostRunning} activeHostRoomId={activeHostRoomId} startLocal={(room) => { const run = state.history.find((item) => item.id === room.hosted?.historyRunId); if (run) void hostLatest(run, room.id); }} stopLocal={() => void stopHost()} openLocalConsole={() => setLogsOpen(true)} />
   ) : view === 'server' ? (
     <ServerSettingsView host={state.host} installRoot={state.settings.installRoot} setHost={(host) => patchState({ host })} notify={notify} />
   ) : view === 'apworlds' ? (
@@ -530,11 +623,12 @@ export function App() {
   );
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" style={{ '--sidebar-width': `${sidebarWidth}px` } as React.CSSProperties}>
       <aside className={`nav-rail ${navOpen ? 'open' : ''}`}>
         <div className="brand-mark"><div className="brand-icon"><Gamepad2 size={21} /></div><div><strong>Archipelago</strong><span>Controller</span></div></div>
         <nav>{navItems.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'active' : ''} onClick={() => { setView(id); setNavOpen(false); }}><Icon size={18} /><span>{label}</span>{id === 'history' && state.history.length > 0 && <em>{state.history.length}</em>}</button>)}</nav>
         <div className="nav-status"><span className={`status-dot ${electronReady ? 'online' : ''}`} /><div><strong>{electronReady ? 'Desktop connected' : 'Browser preview'}</strong><span>{state.settings.installRoot ? 'Installation configured' : 'Setup required'}</span></div></div>
+        <div className="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize navigation" title="Drag to resize navigation" onPointerDown={resizeSidebar} />
       </aside>
       <main className={`app-main ${apUpdate?.state === 'outdated' ? 'has-ap-warning' : ''}`}>
         <header className="topbar">
@@ -546,11 +640,11 @@ export function App() {
           </div>
         </header>
         {apUpdate?.state === 'outdated' && <div className="ap-update-warning" role="alert"><CircleAlert size={20} /><div><strong>Archipelago is out of date</strong><span>Installed {apUpdate.installedVersion} · Latest {apUpdate.latestVersion}</span></div><button className="update-button" onClick={openArchipelagoUpdate}><Download size={15} />Update Archipelago</button></div>}
-        <div className="view-content">{content}</div>
+        <div className="view-content" ref={viewContentRef}>{content}</div>
         <ConsoleDrawer open={logsOpen} setOpen={setLogsOpen} activity={logs} setActivity={setLogs} events={consoleEvents} setEvents={setConsoleEvents}
           running={running} hostRunning={hostRunning} remoteState={remoteState} profiles={state.remoteProfiles}
           hostSettings={state.host} canStartLocal={state.history.some((item) => item.status === 'generated')} startLocal={() => void hostLatest()}
-          setProfiles={(remoteProfiles) => patchState({ remoteProfiles })} copyErrors={copyErrors} notify={notify} />
+          setProfiles={(remoteProfiles) => patchState({ remoteProfiles })} copyErrors={copyErrors} notify={notify} height={consoleHeight} onResize={resizeConsole} />
       </main>
       {toast && <div className="toast"><Check size={16} />{toast}</div>}
       {gameSettingsTarget && <GameSettingsDialog target={gameSettingsTarget} host={state.host} installRoot={state.settings.installRoot} setHost={(host) => patchState({ host })} notify={notify} onClose={() => setGameSettingsTarget(undefined)} />}
@@ -558,12 +652,13 @@ export function App() {
   );
 }
 
-function ConsoleDrawer({ open, setOpen, activity, setActivity, events, setEvents, running, hostRunning, remoteState, profiles, hostSettings, canStartLocal, startLocal, setProfiles, copyErrors, notify }: {
+function ConsoleDrawer({ open, setOpen, activity, setActivity, events, setEvents, running, hostRunning, remoteState, profiles, hostSettings, canStartLocal, startLocal, setProfiles, copyErrors, notify, height, onResize }: {
   open: boolean; setOpen: (value: boolean) => void; activity: string[]; setActivity: React.Dispatch<React.SetStateAction<string[]>>;
   events: ConsoleEvent[]; setEvents: React.Dispatch<React.SetStateAction<ConsoleEvent[]>>; running: string; hostRunning: boolean;
   remoteState: ConsoleConnectionState; profiles: RemoteProfile[]; setProfiles: (profiles: RemoteProfile[]) => void;
   hostSettings: AppState['host']; canStartLocal: boolean; startLocal: () => void;
   copyErrors: () => void; notify: (message: string) => void;
+  height: number; onResize: (event: React.PointerEvent<HTMLDivElement>) => void;
 }) {
   const [tab, setTab] = useState<'console' | 'activity'>('console');
   const [command, setCommand] = useState('');
@@ -641,7 +736,8 @@ function ConsoleDrawer({ open, setOpen, activity, setActivity, events, setEvents
     if (selectedProfileId === profile.id) setSelectedProfileId('');
   };
 
-  return <section className={`log-drawer console-drawer ${open ? 'open' : ''}`}>
+  return <section className={`log-drawer console-drawer ${open ? 'open' : ''}`} style={open ? { height: `${height}px` } : undefined}>
+    {open && <div className="console-resizer" role="separator" aria-orientation="horizontal" aria-label="Resize console" title="Drag to resize console" onPointerDown={onResize} />}
     <div className="log-handle"><button className="drawer-toggle" onClick={() => setOpen(!open)}><TerminalSquare size={16} /><strong>Console</strong><ChevronDown size={16} /></button><StatusChip tone={target === 'none' ? 'neutral' : remoteState === 'connecting' ? 'warn' : 'good'}>{statusLabel}</StatusChip><span>{tab === 'console' ? events.at(-1)?.text ?? 'No active connection' : activity.at(-1)}</span></div>
     {open && <div className="log-body console-body">
       <div className="console-toolbar"><div className="console-tabs"><button className={tab === 'console' ? 'active' : ''} onClick={() => setTab('console')}>Console</button><button className={tab === 'activity' ? 'active' : ''} onClick={() => setTab('activity')}>Activity</button></div><div className="console-actions">
@@ -843,9 +939,9 @@ function Roster({ players, templates, selectedIds, setPlayers, assignTemplate, t
   </div>;
 }
 
-function HistoryView({ history, cloneRun, hostRun, reveal, openBuild, refreshHistory }: { history: HistoryRun[]; cloneRun: (run: HistoryRun) => void; hostRun: (run: HistoryRun) => void; reveal: (path: string) => unknown; openBuild: () => void; refreshHistory: () => void }) {
+function HistoryView({ history, rooms, cloneRun, hostRun, adoptRoom, reveal, openBuild, refreshHistory }: { history: HistoryRun[]; rooms: ManagedRoom[]; cloneRun: (run: HistoryRun) => void; hostRun: (run: HistoryRun) => void; adoptRoom: (run: HistoryRun) => void; reveal: (path: string) => unknown; openBuild: () => void; refreshHistory: () => void }) {
   return <div className="page-view"><div className="page-heading"><div><h1>Session History</h1><p>Generated sessions, logs, and recovery actions</p></div><button className="secondary-button" onClick={refreshHistory}><RefreshCcw size={16} />Import existing</button></div>
-    {history.length === 0 ? <EmptyState icon={History} title="No sessions generated yet" action="Open session build" onAction={openBuild} /> : <div className="history-list">{history.map((run) => <article className="history-row" key={run.id}><div className={`history-state ${run.status}`}><Clock3 size={18} /></div><div className="history-main"><div><strong>{run.name}</strong><StatusChip tone={run.status === 'generated' ? 'good' : 'bad'}>{run.status}</StatusChip></div><span>{formatDate(run.createdAt)} · {run.playerCount || 'Unknown'} players · {run.slotCount || 'Unknown'} slots{run.games.length ? ` · ${run.games.join(', ')}` : ''}</span>{run.slots?.length ? <small className="history-slots">{run.slots.map((slot) => `${slot.game}: ${slot.name}`).join(' · ')}</small> : <small>{run.notes || 'No session notes'}</small>}</div><div className="history-actions">{run.slots?.length ? <IconButton label="Copy game connection slots" onClick={() => void navigator.clipboard.writeText(run.slots!.map((slot) => `${slot.game}: ${slot.name}`).join('\n'))}><Clipboard size={16} /></IconButton> : null}<IconButton label="Open output folder" onClick={() => reveal(run.outputPath)}><FolderOpen size={17} /></IconButton><button className="secondary-button" disabled={!run.templateIds.length} onClick={() => cloneRun(run)}><Copy size={15} />Clone</button><button className="secondary-button" disabled={run.status !== 'generated'} onClick={() => hostRun(run)}><Play size={15} />Host</button></div></article>)}</div>}
+    {history.length === 0 ? <EmptyState icon={History} title="No sessions generated yet" action="Open session build" onAction={openBuild} /> : <div className="history-list">{history.map((run) => { const roomExists = rooms.some((room) => room.provider?.type === 'local' && room.provider.historyRunId === run.id); return <article className="history-row" key={run.id}><div className={`history-state ${run.status}`}><Clock3 size={18} /></div><div className="history-main"><div><strong>{run.name}</strong><StatusChip tone={run.status === 'generated' ? 'good' : 'bad'}>{run.status}</StatusChip>{roomExists && <StatusChip tone="neutral">Room ready</StatusChip>}</div><span>{formatDate(run.createdAt)} · {run.playerCount || 'Unknown'} players · {run.slotCount || 'Unknown'} slots{run.games.length ? ` · ${run.games.join(', ')}` : ''}</span>{run.slots?.length ? <small className="history-slots">{run.slots.map((slot) => `${slot.game}: ${slot.name}`).join(' · ')}</small> : <small>{run.notes || 'No session notes'}</small>}</div><div className="history-actions">{run.slots?.length ? <IconButton label="Copy game connection slots" onClick={() => void navigator.clipboard.writeText(run.slots!.map((slot) => `${slot.game}: ${slot.name}`).join('\n'))}><Clipboard size={16} /></IconButton> : null}<IconButton label="Open output folder" onClick={() => reveal(run.outputPath)}><FolderOpen size={17} /></IconButton><button className="secondary-button" disabled={!run.templateIds.length} onClick={() => cloneRun(run)}><Copy size={15} />Clone</button>{!roomExists && <button className="secondary-button" disabled={run.status !== 'generated' || !run.slots?.length} onClick={() => adoptRoom(run)}><Link size={15} />Create room</button>}<button className="secondary-button" disabled={run.status !== 'generated'} onClick={() => hostRun(run)}><Play size={15} />Host</button></div></article>; })}</div>}
   </div>;
 }
 
@@ -925,7 +1021,8 @@ function SettingsView({ state, patchState, apUpdate, checkingApUpdate, checkArch
   return <div className="page-view settings-view"><div className="page-heading"><div><h1>Settings</h1><p>Archipelago tools, storage, and generation defaults</p></div><StatusChip tone={electronReady ? 'good' : 'warn'}>{electronReady ? 'Desktop bridge active' : 'Browser preview'}</StatusChip></div>
     <section className="settings-section"><div><Server size={19} /><span><strong>Archipelago tools</strong><small>Generator, server, clients, and APWorlds are discovered here</small></span></div><div className="settings-fields"><PathField label="Installation folder" value={state.settings.installRoot} onChange={(value) => update('installRoot', value)} onBrowse={() => choose('installRoot', 'directory', 'Choose Archipelago installation')} /><div className="ap-version-row"><span><strong>Archipelago {apUpdate?.installedVersion ?? 'Unknown'}</strong><small>{apUpdate?.state === 'outdated' ? `${apUpdate.latestVersion} available` : apUpdate?.state === 'current' ? 'Latest stable release installed' : apUpdate?.state === 'ahead' ? 'Newer than the latest stable release' : apUpdate?.error || 'Release status has not been checked'}</small></span><div className="tool-actions"><button className="secondary-button" disabled={checkingApUpdate || !state.settings.installRoot} onClick={checkArchipelagoUpdate}>{checkingApUpdate ? <LoaderCircle className="spin" size={15} /> : <RefreshCcw size={15} />}Check now</button>{apUpdate?.state === 'outdated' && <button className="update-button" onClick={openArchipelagoUpdate}><Download size={15} />Update</button>}</div></div><label>Generator arguments<input value={state.settings.generatorArgs} onChange={(event) => update('generatorArgs', event.target.value)} /><small>Available placeholders: {'{input}'}, {'{output}'}, {'{root}'}</small></label></div></section>
     <section className="settings-section"><div><Gamepad2 size={19} /><span><strong>External trackers</strong><small>Configured programs appear as buttons on the Tools screen</small></span></div><div className="settings-fields"><PathField label="PopTracker executable" value={state.settings.popTrackerPath} onChange={(value) => update('popTrackerPath', value)} onBrowse={() => choose('popTrackerPath', 'file', 'Choose PopTracker executable')} /><PathField label="EmoTracker executable" value={state.settings.emoTrackerPath} onChange={(value) => update('emoTrackerPath', value)} onBrowse={() => choose('emoTrackerPath', 'file', 'Choose EmoTracker executable')} /></div></section>
-    <section className="settings-section"><div><FolderOpen size={19} /><span><strong>Storage</strong><small>Paths beginning with {'{main}'} follow the installation folder</small></span></div><div className="settings-fields"><PathField label="Current YAML source" value={state.settings.importSource} resolvedValue={resolveMainPath(state.settings.importSource, state.settings.installRoot)} onChange={(value) => update('importSource', value)} onBrowse={() => choose('importSource', 'directory', 'Choose YAML source folder')} /><PathField label="Managed template library" value={state.settings.libraryPath} resolvedValue={resolveMainPath(state.settings.libraryPath, state.settings.installRoot)} onChange={(value) => update('libraryPath', value)} onBrowse={() => choose('libraryPath', 'directory', 'Choose template library')} /><PathField label="Archipelago output" value={state.settings.outputRoot} resolvedValue={resolveMainPath(state.settings.outputRoot, state.settings.installRoot)} onChange={(value) => update('outputRoot', value)} onBrowse={() => choose('outputRoot', 'directory', 'Choose output folder')} /><PathField label="Hosted sessions" value={state.settings.hostedSessionsPath} resolvedValue={resolveMainPath(state.settings.hostedSessionsPath, state.settings.installRoot)} onChange={(value) => update('hostedSessionsPath', value)} onBrowse={() => choose('hostedSessionsPath', 'directory', 'Choose hosted sessions folder')} /></div></section>
+    <section className="settings-section"><div><Globe2 size={19} /><span><strong>Public room sharing</strong><small>Optional HTTPS gateway for browser and Controller invitations</small></span></div><div className="settings-fields gateway-settings"><label>Gateway<select value={state.settings.roomGatewayMode} onChange={(event) => update('roomGatewayMode', event.target.value)}><option value="local">Local only</option><option value="managed">Managed HTTPS</option><option value="external">External HTTPS proxy</option><option value="direct">Direct HTTP</option></select><small>{state.settings.roomGatewayMode === 'managed' ? 'Controller runs its bundled HTTPS gateway and renews the certificate.' : state.settings.roomGatewayMode === 'external' ? 'An existing reverse proxy or tunnel forwards to the room portal.' : state.settings.roomGatewayMode === 'direct' ? 'Public traffic is unencrypted and requires confirmation for every room.' : 'Public invitations are unavailable; local hosting still works.'}</small></label>{state.settings.roomGatewayMode === 'managed' && <><label>Public hostname<input value={state.settings.roomGatewayHostname} onChange={(event) => update('roomGatewayHostname', event.target.value.trim())} placeholder="rooms.example.net" /><small>DNS must resolve to this computer's public connection.</small></label><label>Certificate contact email<input type="email" value={state.settings.roomGatewayEmail} onChange={(event) => update('roomGatewayEmail', event.target.value.trim())} placeholder="host@example.net" /><small>Used only for ACME certificate registration and expiry notices.</small></label></>}{state.settings.roomGatewayMode === 'external' && <label>Public HTTPS URL<input type="url" value={state.settings.roomGatewayPublicUrl} onChange={(event) => update('roomGatewayPublicUrl', event.target.value.trim())} placeholder="https://rooms.example.net" /><small>The proxy must forward this origin to the configured room portal port.</small></label>}</div></section>
+    <section className="settings-section"><div><FolderOpen size={19} /><span><strong>Storage</strong><small>Use {'{main}'} for the installation or {'{hosted}'} for the hosted-session folder</small></span></div><div className="settings-fields"><PathField label="Current YAML source" value={state.settings.importSource} resolvedValue={resolveMainPath(state.settings.importSource, state.settings.installRoot)} onChange={(value) => update('importSource', value)} onBrowse={() => choose('importSource', 'directory', 'Choose YAML source folder')} /><PathField label="Managed template library" value={state.settings.libraryPath} resolvedValue={resolveMainPath(state.settings.libraryPath, state.settings.installRoot)} onChange={(value) => update('libraryPath', value)} onBrowse={() => choose('libraryPath', 'directory', 'Choose template library')} /><PathField label="Archipelago output" value={state.settings.outputRoot} resolvedValue={resolveMainPath(state.settings.outputRoot, state.settings.installRoot)} onChange={(value) => update('outputRoot', value)} onBrowse={() => choose('outputRoot', 'directory', 'Choose output folder')} /><PathField label="Hosted sessions" value={state.settings.hostedSessionsPath} resolvedValue={resolveMainPath(state.settings.hostedSessionsPath, state.settings.installRoot)} onChange={(value) => update('hostedSessionsPath', value)} onBrowse={() => choose('hostedSessionsPath', 'directory', 'Choose hosted sessions folder')} /><PathField label="Managed rooms" value={state.settings.roomsRoot} resolvedValue={resolveStoragePath(state.settings.roomsRoot, state.settings.installRoot, state.settings.hostedSessionsPath)} onChange={(value) => update('roomsRoot', value)} onBrowse={() => choose('roomsRoot', 'directory', 'Choose managed rooms folder')} /></div></section>
     <section className="settings-section"><div><ExternalLink size={19} /><span><strong>Launch site</strong><small>Remote hosting upload destination</small></span></div><div className="settings-fields"><label>URL<input type="url" value={state.settings.launchUrl} onChange={(event) => update('launchUrl', event.target.value)} /></label></div></section>
     <button className="secondary-button reset-button" onClick={() => patchState({ settings: initialState.settings })}><RefreshCcw size={16} />Restore defaults</button>
   </div>;

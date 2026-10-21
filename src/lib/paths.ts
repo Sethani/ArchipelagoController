@@ -1,6 +1,7 @@
 import type { Settings } from '../types';
 
 export const MAIN_PATH_TOKEN = '{main}';
+export const HOSTED_PATH_TOKEN = '{hosted}';
 
 export type MainRelativeSetting = 'importSource' | 'libraryPath' | 'outputRoot' | 'hostedSessionsPath';
 
@@ -16,6 +17,15 @@ export function resolveMainPath(value: string, installRoot: string): string {
   const root = normalized(installRoot);
   if (!root) return '';
   const suffix = (match[1] ?? '').replace(/[\\/]+/g, '\\');
+  return suffix ? `${root}\\${suffix}` : root;
+}
+
+export function resolveStoragePath(value: string, installRoot: string, hostedRoot: string): string {
+  const hostedMatch = value.trim().match(/^\{hosted\}(?:[\\/](.*))?$/i);
+  if (!hostedMatch) return resolveMainPath(value, installRoot);
+  const root = normalized(resolveMainPath(hostedRoot, installRoot));
+  if (!root) return '';
+  const suffix = (hostedMatch[1] ?? '').replace(/[\\/]+/g, '\\');
   return suffix ? `${root}\\${suffix}` : root;
 }
 

@@ -1,4 +1,4 @@
-export type View = 'build' | 'library' | 'roster' | 'history' | 'server' | 'apworlds' | 'tools' | 'settings';
+export type View = 'build' | 'library' | 'roster' | 'history' | 'rooms' | 'server' | 'apworlds' | 'tools' | 'settings';
 
 export type ArchipelagoUpdateStatus = {
   state: 'current' | 'outdated' | 'ahead' | 'unknown';
@@ -178,12 +178,235 @@ export type Settings = {
   installRoot: string;
   importSource: string;
   hostedSessionsPath: string;
+  roomsRoot: string;
   popTrackerPath: string;
   emoTrackerPath: string;
   libraryPath: string;
   outputRoot: string;
   launchUrl: string;
   generatorArgs: string;
+  roomGatewayMode: 'local' | 'managed' | 'external' | 'direct';
+  roomGatewayHostname: string;
+  roomGatewayEmail: string;
+  roomGatewayPublicUrl: string;
+};
+
+export type RoomFile = {
+  id: string;
+  name: string;
+  path: string;
+  kind: 'downloaded' | 'imported' | 'prepared' | 'generated';
+  size: number;
+  modifiedAt: string;
+  sourceFileId?: string;
+};
+
+export type ManagedRoomSlot = {
+  slot: number;
+  name: string;
+  game: string;
+  mine: boolean;
+  downloadAvailable: boolean;
+  files: RoomFile[];
+};
+
+export type RoomTrackerPlayer = {
+  slot: number;
+  name: string;
+  alias?: string;
+  game: string;
+  checksDone: number;
+  checksTotal: number;
+  itemsReceived: number;
+  status: number;
+  statusLabel: string;
+  lastActivity?: string;
+  lastConnection?: string;
+  hintCount: number;
+  unresolvedHintCount: number;
+};
+
+export type RoomTrackerHint = {
+  receivingSlot: number;
+  receivingName: string;
+  findingSlot: number;
+  findingName: string;
+  itemId: number;
+  item: string;
+  locationId: number;
+  location: string;
+  found: boolean;
+  entrance: string;
+  flags: number;
+  status: number;
+  classification: 'Progression' | 'Useful' | 'Trap' | 'Filler';
+  statusLabel: string;
+};
+
+export type RoomTrackerDashboard = {
+  refreshedAt: string;
+  players: RoomTrackerPlayer[];
+  hints: RoomTrackerHint[];
+  checksDone: number;
+  checksTotal: number;
+  completedPlayers: number;
+  unresolvedHints: number;
+};
+
+export type RoomLogicAnalysis = {
+  inLogic: number;
+  glitched: number;
+  available: number;
+  locations: string[];
+  analyzedAt: string;
+  templateUsed: boolean;
+};
+
+export type RoomStatusSnapshot = {
+  trackerId?: string;
+  lastPort?: number;
+  endpoint?: RoomEndpoint;
+  lastActivity?: string;
+  timeout?: number;
+  refreshedAt: string;
+  stale: boolean;
+  error?: string;
+};
+
+export type RoomProviderType = 'official' | 'local' | 'controller';
+
+export type RoomProviderDescriptor = {
+  type: RoomProviderType;
+  roomUrl?: string;
+  historyRunId?: string;
+  apiVersion?: number;
+};
+
+export type RoomEndpoint = {
+  host: string;
+  port: number;
+  secure: boolean;
+};
+
+export type RoomShareState = 'offline' | 'starting' | 'online' | 'stopping' | 'sharing' | 'error';
+
+export type RoomShareStatus = {
+  state: RoomShareState;
+  serverRunning: boolean;
+  portalRunning: boolean;
+  mapping: 'disabled' | 'starting' | 'mapped' | 'failed' | 'unknown';
+  reachability: 'local' | 'observed' | 'unknown';
+  publicUrl?: string;
+  error?: string;
+  gateway?: 'disabled' | 'starting' | 'online' | 'error';
+  certificate?: 'unused' | 'obtaining' | 'ready' | 'error';
+  gatewayError?: string;
+  secureGameEndpoint?: string;
+  compatibilityGameEndpoint?: string;
+};
+
+export type RoomGatewayConfig = {
+  mode: Settings['roomGatewayMode'];
+  hostname: string;
+  email: string;
+  publicBaseUrl: string;
+};
+
+export type HostedRoomConfig = {
+  historyRunId: string;
+  sessionPath: string;
+  artifactPath?: string;
+  savePath?: string | null;
+  advertisedHost: string;
+  gamePort: number;
+  portalPort: number;
+  publicBaseUrl: string;
+  automaticPortMapping: boolean;
+  insecureHttpAccepted: boolean;
+  sharedSlots: number[];
+  shareStatus: RoomShareStatus;
+};
+
+export type RoomInvite = {
+  roomId: string;
+  browserUrl: string;
+  controllerUrl: string;
+};
+
+export type SharedRoomFile = {
+  id: string;
+  slot: number;
+  name: string;
+  size: number;
+  kind: RoomFile['kind'];
+};
+
+export type RoomLaunchCapability = {
+  displayName?: string;
+  gameName?: string;
+  supportsUri: boolean;
+  mode: 'uri' | 'patch-only' | 'file-only';
+};
+
+export type PopTrackerVariant = { id: string; name: string; supportsAp: boolean };
+export type PopTrackerPack = {
+  uid: string;
+  gameName: string;
+  name: string;
+  version: string;
+  filePath: string;
+  variants: PopTrackerVariant[];
+};
+export type PopTrackerAssociation = { packUid: string; variant: string };
+
+export type GameLaunchAction = {
+  type: 'steam' | 'program' | 'url' | 'file' | 'minecraft';
+  steamMode?: 'app' | 'game' | 'source';
+  appId?: string;
+  sourceModPath?: string;
+  path?: string;
+  target?: string;
+  arguments?: string;
+  workingDirectory?: string;
+  launcherPath?: string;
+  minecraftRoot?: string;
+  minecraftProfileId?: string;
+  minecraftProfileName?: string;
+  minecraftVersion?: string;
+};
+
+export type MinecraftLauncherInventory = {
+  launcherPath: string;
+  minecraftRoot: string;
+  profilePath?: string;
+  profiles: Array<{ id: string; name: string; version: string; gameDirectory: string; lastUsed: string; neoForge: boolean }>;
+  error?: string;
+};
+
+export type GameLaunchProfile = {
+  id: string;
+  game: string;
+  label: string;
+  primary: GameLaunchAction;
+  companion?: GameLaunchAction;
+  companionMode?: 'automatic' | 'manual';
+  companionLabel?: string;
+  updatedAt: string;
+};
+
+export type ManagedRoom = {
+  id: string;
+  label: string;
+  url: string;
+  folderPath: string;
+  createdAt: string;
+  passwordRef?: string;
+  passwordSet: boolean;
+  autoLoginWarningAccepted: boolean;
+  slots: ManagedRoomSlot[];
+  status: RoomStatusSnapshot;
+  provider?: RoomProviderDescriptor;
+  hosted?: HostedRoomConfig;
 };
 
 export type HostSettings = {
@@ -212,6 +435,10 @@ export type RemoteProfile = {
   serverPasswordSet: boolean;
   historyRunId?: string;
   lastConnectedAt?: string;
+  roomId?: string;
+  roomSlot?: number;
+  roomUrl?: string;
+  roomProvider?: RoomProviderDescriptor;
 };
 
 export type ConsoleTarget = 'none' | 'local' | 'remote';
@@ -259,6 +486,9 @@ export type AppState = {
   history: HistoryRun[];
   presets: SessionPreset[];
   remoteProfiles: RemoteProfile[];
+  rooms: ManagedRoom[];
+  popTrackerAssociations: Record<string, PopTrackerAssociation>;
+  gameLaunchProfiles: Record<string, GameLaunchProfile>;
   slotLockControllers: SlotLockControllerConfig[];
   settings: Settings;
   host: HostSettings;

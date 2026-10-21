@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { migrateMainRelativeSettings, resolveMainPath, tokenizeMainPath } from './paths';
+import { migrateMainRelativeSettings, resolveMainPath, resolveStoragePath, tokenizeMainPath } from './paths';
 import { initialState } from './storage';
 
 describe('installation-relative paths', () => {
@@ -10,6 +10,11 @@ describe('installation-relative paths', () => {
   it('converts child paths case-insensitively without capturing similarly named folders', () => {
     expect(tokenizeMainPath('c:\\programdata\\ARCHIPELAGO\\output', 'C:\\ProgramData\\Archipelago')).toBe('{main}\\output');
     expect(tokenizeMainPath('C:\\ProgramData\\ArchipelagoBackup\\output', 'C:\\ProgramData\\Archipelago')).toBe('C:\\ProgramData\\ArchipelagoBackup\\output');
+  });
+
+  it('resolves managed rooms beneath the hosted sessions folder', () => {
+    expect(resolveStoragePath('{hosted}\\Rooms', 'D:\\Archipelago', 'C:\\games\\archipelago')).toBe('C:\\games\\archipelago\\Rooms');
+    expect(resolveStoragePath('{hosted}\\Rooms', 'D:\\Archipelago', '{main}\\Hosted')).toBe('D:\\Archipelago\\Hosted\\Rooms');
   });
 
   it('keeps external storage absolute during migration', () => {

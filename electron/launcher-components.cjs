@@ -15,12 +15,16 @@ function cleanLabel(value) {
 function sourceComponents(source) {
   const results = [];
   const text = String(source ?? '');
-  for (const match of text.matchAll(SOURCE_COMPONENT)) {
+  const matches = [...text.matchAll(SOURCE_COMPONENT)];
+  for (let index = 0; index < matches.length; index += 1) {
+    const match = matches[index];
     const displayName = cleanLabel(match[2]);
     if (!displayName) continue;
-    const tail = text.slice(match.index, match.index + 900);
+    const tail = text.slice(match.index, Math.min(matches[index + 1]?.index ?? text.length, match.index + 1200));
     const type = tail.match(/component_type\s*=\s*(?:Type\.)?([A-Z_]+)/)?.[1]?.toLowerCase() ?? 'unknown';
-    results.push({ displayName, type });
+    const supportsUri = /supports_uri\s*=\s*True\b/.test(tail);
+    const gameName = tail.match(/game_name\s*=\s*(["'])([^"'\r\n]{1,100})\1/)?.[2]?.trim();
+    results.push({ displayName, type, supportsUri, gameNames: gameName ? [gameName] : [] });
   }
   return results;
 }
@@ -30,7 +34,7 @@ function compiledComponents(contents) {
   const raw = buffer.toString('latin1');
   if (!raw.includes('LauncherComponents') || !raw.includes('Component')) return [];
   const strings = raw.match(/[\x20-\x7e]{4,120}/g) ?? [];
-  return strings.map(cleanLabel).filter(Boolean).map((displayName) => ({ displayName, type: 'unknown' }));
+  return strings.map(cleanLabel).filter(Boolean).map((displayName) => ({ displayName, type: 'unknown', supportsUri: false, gameNames: [] }));
 }
 
 function componentsFromEntries(entries, fallbackName, origin) {
@@ -91,8 +95,23 @@ async function inventoryLauncherComponents(installRoot) {
   for (const component of results) {
     const key = component.displayName.toLocaleLowerCase();
     if (!unique.has(key)) unique.set(key, component);
+    else {
+      const existing = unique.get(key);
+      existing.supportsUri ||= component.supportsUri;
+      existing.gameNames = [...new Set([...(existing.gameNames ?? []), ...(component.gameNames ?? [])])];
+    }
   }
   return [...unique.values()].sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 
-module.exports = { compiledComponents, componentsFromEntries, inventoryLauncherComponents, sourceComponents };
+function resolveLauncherClient(components, game) {
+  const normalized = String(game ?? '').trim().toLocaleLowerCase();
+  const candidates = components.filter((component) => component.type === 'client' && [component.sourceWorld, ...(component.gameNames ?? [])]
+    .some((name) => String(name).trim().toLocaleLowerCase() === normalized));
+  const uri = candidates.find((component) => component.supportsUri);
+  return uri ? { displayName: uri.displayName, supportsUri: true, mode: 'uri', gameName: uri.gameNames?.[0] || game }
+    : candidates[0] ? { displayName: candidates[0].displayName, supportsUri: false, mode: 'patch-only', gameName: candidates[0].gameNames?.[0] || game }
+      : { supportsUri: false, mode: 'file-only' };
+}
+
+module.exports = { compiledComponents, componentsFromEntries, inventoryLauncherComponents, resolveLauncherClient, sourceComponents };

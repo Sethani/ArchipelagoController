@@ -5,23 +5,38 @@ import { defaultSlotLockOptions } from './slotlock';
 
 const KEY = 'archipelago-controller-state-v1';
 
+function withoutLegacyAccessToken<T extends object>(value: T): T {
+  const migrated = { ...value } as T & { accessTokenRef?: unknown; accessTokenSet?: unknown };
+  delete migrated.accessTokenRef;
+  delete migrated.accessTokenSet;
+  return migrated;
+}
+
 export const initialState: AppState = {
   templates: [],
   selectedIds: [],
   players: [],
   history: [],
   presets: [],
+  rooms: [],
+  popTrackerAssociations: {},
+  gameLaunchProfiles: {},
   slotLockControllers: [],
   settings: {
     installRoot: 'C:\\ProgramData\\Archipelago',
     importSource: '{main}\\Players\\Temp',
     hostedSessionsPath: 'C:\\games\\archipelago',
+    roomsRoot: '{hosted}\\Rooms',
     popTrackerPath: '',
     emoTrackerPath: '',
     libraryPath: '{main}\\Players\\ControllerLibrary',
     outputRoot: '{main}\\output',
     launchUrl: 'https://archipelago.gg/uploads',
     generatorArgs: '--player_files_path "{input}" --outputpath "{output}"',
+    roomGatewayMode: 'local',
+    roomGatewayHostname: '',
+    roomGatewayEmail: '',
+    roomGatewayPublicUrl: '',
   },
   host: {
     host: '',
@@ -90,6 +105,32 @@ export function loadState(): AppState {
         roomPasswordSet: Boolean(parsedHost.roomPasswordSet || parsedHost.password),
       },
       remoteProfiles: parsed.remoteProfiles ?? [],
+      rooms: (parsed.rooms ?? []).map((room) => ({
+        ...room,
+        provider: room.provider ? withoutLegacyAccessToken(room.provider) : { type: 'official', roomUrl: room.url },
+        passwordSet: Boolean(room.passwordSet),
+        autoLoginWarningAccepted: Boolean(room.autoLoginWarningAccepted),
+        slots: (room.slots ?? []).map((slot) => ({ ...slot, mine: Boolean(slot.mine), files: slot.files ?? [] })),
+        status: { ...room.status, stale: room.status?.stale ?? true },
+        hosted: room.hosted ? {
+          ...withoutLegacyAccessToken(room.hosted),
+          publicBaseUrl: room.hosted.publicBaseUrl ?? '',
+          advertisedHost: room.hosted.advertisedHost ?? '',
+          automaticPortMapping: room.hosted.automaticPortMapping ?? true,
+          insecureHttpAccepted: Boolean(room.hosted.insecureHttpAccepted),
+          sharedSlots: room.hosted.sharedSlots ?? [],
+          shareStatus: { state: 'offline', serverRunning: false, portalRunning: false, mapping: 'unknown', reachability: 'unknown' },
+        } : undefined,
+      })),
+      popTrackerAssociations: parsed.popTrackerAssociations ?? {},
+      gameLaunchProfiles: Object.fromEntries(Object.entries(parsed.gameLaunchProfiles ?? {}).map(([key, profile]) => {
+        const witness = profile.game.trim().toLocaleLowerCase() === 'the witness';
+        return [key, {
+          ...profile,
+          companionMode: profile.companion ? profile.companionMode ?? (witness ? 'manual' : 'automatic') : undefined,
+          companionLabel: profile.companion ? profile.companionLabel ?? (witness ? 'Run randomizer' : undefined) : undefined,
+        }];
+      })),
       slotLockControllers: (parsed.slotLockControllers ?? []).map((config) => ({
         ...config,
         excludedTemplateIds: config.excludedTemplateIds ?? [],

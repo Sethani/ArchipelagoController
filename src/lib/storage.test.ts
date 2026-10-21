@@ -38,4 +38,27 @@ describe('stored host settings', () => {
     expect(settings.outputRoot).toBe('{main}\\output');
     expect(settings.hostedSessionsPath).toBe('C:\\games\\archipelago');
   });
+
+  it('removes legacy room access-token metadata', () => {
+    localStorage.setItem('archipelago-controller-state-v1', JSON.stringify({
+      ...initialState,
+      rooms: [{
+        id: 'local-test-room', label: 'Test room', url: 'local://room/local-test-room', folderPath: 'C:\\Rooms\\Test',
+        createdAt: '2026-10-20T00:00:00.000Z', passwordSet: false, autoLoginWarningAccepted: false,
+        provider: { type: 'local', historyRunId: 'run-1', accessTokenRef: 'legacy-guest-token' },
+        slots: [], status: { refreshedAt: '2026-10-20T00:00:00.000Z', stale: true },
+        hosted: {
+          historyRunId: 'run-1', sessionPath: 'C:\\Sessions\\Test', advertisedHost: 'rooms.example.test',
+          gamePort: 38281, portalPort: 38282, publicBaseUrl: '', automaticPortMapping: false,
+          insecureHttpAccepted: false, sharedSlots: [], accessTokenRef: 'legacy-host-token', accessTokenSet: true,
+          shareStatus: { state: 'offline', serverRunning: false, portalRunning: false, mapping: 'unknown', reachability: 'unknown' },
+        },
+      }],
+    }));
+
+    const room = loadState().rooms[0];
+    expect('accessTokenRef' in room.provider!).toBe(false);
+    expect('accessTokenRef' in room.hosted!).toBe(false);
+    expect('accessTokenSet' in room.hosted!).toBe(false);
+  });
 });

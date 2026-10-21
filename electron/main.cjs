@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, net, safeStorage, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, net, safeStorage, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const fs = require('node:fs/promises');
@@ -7,19 +7,56 @@ const os = require('node:os');
 const { extractZip } = require('./archive.cjs');
 const { createApWorldService } = require('./apworlds.cjs');
 const { createYamlValidator } = require('./yaml-validation.cjs');
-const { inventoryLauncherComponents } = require('./launcher-components.cjs');
+const { inventoryLauncherComponents, resolveLauncherClient } = require('./launcher-components.cjs');
 const { createApUpdateService } = require('./ap-update.cjs');
 const { readHostConfig, writeHostConfig } = require('./host-config.cjs');
+const rooms = require('./rooms.cjs');
+const { createRoomPortal, localAddress } = require('./room-portal.cjs');
+const { createHttpsGateway } = require('./https-gateway.cjs');
+const { inventoryPopTracker, popTrackerArgs } = require('./poptracker.cjs');
+const { actionFromShortcut, launchProfile } = require('./game-launch.cjs');
+const { inventoryMinecraftLauncher } = require('./minecraft-launcher.cjs');
+const { parseUniversalTrackerOutput } = require('./universal-tracker.cjs');
+const { createTrackerSidecar } = require('./tracker-sidecar.cjs');
 const YAML = require('yaml');
 
 const isDev = process.argv.includes('--dev');
+const ROOM_HOST = 'archipelago.gg';
 const isSmoke = process.argv.includes('--smoke') || process.env.ARCHIPELAGO_CONTROLLER_SMOKE === '1';
 let activeHost = null;
+let activeHostMeta = null;
 let remoteConsole = null;
 let quitting = false;
 let mainWindow = null;
 let activeGeneratorJobs = 0;
 let validationBusy = false;
+let activeShare = null;
+let gatewayStatus = { gateway: 'disabled', certificate: 'unused' };
+let pendingRoomInvite = process.argv.find((value) => /^archipelago-controller:\/\/join/i.test(value));
+const trackerPackageCache = new Map();
+const roomPortal = createRoomPortal({
+  patchArchive: rooms.patchArchive,
+  onObserved: () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:share-status', { reachability: 'observed' });
+  },
+});
+const trackerSidecar = createTrackerSidecar({
+  createSocket: (url) => new net.WebSocket(url),
+  onUpdate: (snapshot) => {
+    if (activeShare?.roomId === snapshot.roomId) roomPortal.updateTracker(snapshot);
+  },
+});
+const httpsGateway = createHttpsGateway({
+  app,
+  spawn,
+  onStatus: (status) => {
+    gatewayStatus = { ...gatewayStatus, ...status };
+    if (activeShare) void publishShareStatus({ roomId: activeShare.roomId, ...gatewayStatus });
+  },
+  onLog: (line) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('process:log', `[HTTPS] ${line}\n`);
+  },
+});
 
 const apWorldService = createApWorldService({
   app,
@@ -34,6 +71,25 @@ const yamlValidator = createYamlValidator({
 const apUpdateService = createApUpdateService({ app, net });
 
 app.setAppUserModelId('io.archipelago.controller');
+if (process.defaultApp && process.argv[1]) app.setAsDefaultProtocolClient('archipelago-controller', process.execPath, [path.resolve(process.argv[1])]);
+else app.setAsDefaultProtocolClient('archipelago-controller');
+const singleInstance = app.requestSingleInstanceLock();
+if (!singleInstance) app.quit();
+app.on('second-instance', (_event, argv) => {
+  const invite = argv.find((value) => /^archipelago-controller:\/\/join/i.test(value));
+  if (invite) {
+    pendingRoomInvite = invite;
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:invite', invite);
+  }
+  if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
+});
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  if (/^archipelago-controller:\/\/join/i.test(url)) {
+    pendingRoomInvite = url;
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:invite', url);
+  }
+});
 
 const executablePath = (installRoot, name) => installRoot ? path.join(installRoot, name) : '';
 const secretFile = () => path.join(app.getPath('userData'), 'secrets.json');
@@ -75,6 +131,15 @@ async function setSecret(id, value) {
   return { ok: true, configured: Boolean(value) };
 }
 
+async function removeLegacyRoomAccessSecrets() {
+  const secrets = await readSecrets();
+  const legacyIds = Object.keys(secrets).filter((id) => id.startsWith('room-share:') || id.startsWith('room-access:'));
+  if (!legacyIds.length) return;
+  for (const id of legacyIds) delete secrets[id];
+  await fs.mkdir(path.dirname(secretFile()), { recursive: true });
+  await fs.writeFile(secretFile(), JSON.stringify(secrets), 'utf8');
+}
+
 function sendConsole(sender, target, text, level = 'info') {
   if (!sender || sender.isDestroyed() || !text) return;
   sender.send('console:event', { target, level, text: String(text).trimEnd(), timestamp: new Date().toISOString() });
@@ -82,6 +147,7 @@ function sendConsole(sender, target, text, level = 'info') {
 
 function sendHostOutput(sender, chunk, fallbackLevel) {
   for (const line of String(chunk).split(/\r?\n/).filter(Boolean)) {
+    if (activeShare) roomPortal.updatePresence(line);
     if (/connection rejected \(400 Bad Request\)/i.test(line)) {
       sendConsole(sender, 'local', 'Client WebSocket probe rejected; waiting for its automatic retry.', 'info');
     } else if (/\bconnection (open|closed)\b/i.test(line)) {
@@ -121,7 +187,8 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  await removeLegacyRoomAccessSecrets().catch(() => {});
   createWindow();
   app.on('activate', () => BrowserWindow.getAllWindows().length === 0 && createWindow());
 });
@@ -132,6 +199,9 @@ app.on('before-quit', () => {
   if (remoteConsole?.reconnectTimer) clearTimeout(remoteConsole.reconnectTimer);
   remoteConsole?.socket?.close();
   if (activeHost && activeHost.exitCode === null) activeHost.kill();
+  trackerSidecar.stop();
+  void roomPortal.stop();
+  void httpsGateway.stop();
 });
 
 ipcMain.handle('files:pick-yaml', async () => {
@@ -169,6 +239,40 @@ ipcMain.handle('files:pick-executable', async (_event, title) => {
     filters: process.platform === 'win32' ? [{ name: 'Programs', extensions: ['exe', 'bat', 'cmd'] }] : [],
   });
   return result.canceled ? null : result.filePaths[0];
+});
+
+ipcMain.handle('files:pick-launch-file', async (_event, title) => {
+  const result = await dialog.showOpenDialog({ title: String(title ?? 'Choose a launch file'), properties: ['openFile'] });
+  return result.canceled ? null : result.filePaths[0];
+});
+
+ipcMain.handle('files:pick-launch-shortcut', async () => {
+  const result = await dialog.showOpenDialog({ title: 'Import a Windows or Steam shortcut', properties: ['openFile'], filters: [{ name: 'Shortcuts', extensions: ['lnk', 'url'] }] });
+  if (result.canceled || !result.filePaths[0]) return null;
+  const shortcutPath = result.filePaths[0];
+  if (/\.url$/i.test(shortcutPath)) {
+    const contents = await fs.readFile(shortcutPath, 'utf8');
+    const target = contents.match(/^URL=(.+)$/mi)?.[1]?.trim();
+    if (!target) throw new Error('That Internet shortcut has no URL.');
+    return { action: actionFromShortcut({ target }), name: path.basename(shortcutPath, path.extname(shortcutPath)) };
+  }
+  const shortcut = shell.readShortcutLink(shortcutPath);
+  return { action: actionFromShortcut(shortcut), name: shortcut.description || path.basename(shortcutPath, path.extname(shortcutPath)) };
+});
+
+ipcMain.handle('files:pick-steam-source-mod', async () => {
+  const defaultPath = path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Steam', 'steamapps', 'sourcemods');
+  const result = await dialog.showOpenDialog({ title: 'Choose a Steam Source mod', defaultPath, properties: ['openDirectory'] });
+  if (result.canceled || !result.filePaths[0]) return null;
+  const folder = path.resolve(result.filePaths[0]);
+  const entries = await fs.readdir(folder, { withFileTypes: true });
+  const gameInfoName = entries.find((entry) => entry.isFile() && entry.name.toLocaleLowerCase() === 'gameinfo.txt')?.name;
+  if (!gameInfoName) throw new Error('That folder has no GameInfo.txt and is not a Source mod.');
+  const contents = await fs.readFile(path.join(folder, gameInfoName), 'utf8');
+  const appId = contents.match(/\bSteamAppId\s+"?(\d+)"?/i)?.[1];
+  if (!appId) throw new Error('GameInfo.txt does not declare a SteamAppId.');
+  const title = contents.match(/^\s*(?:title|game)\s+"([^"]+)"/mi)?.[1] ?? path.basename(folder);
+  return { path: folder, appId, title };
 });
 
 ipcMain.handle('files:pick-apworld', async () => {
@@ -287,7 +391,15 @@ async function launchArchipelagoLauncher(installRoot, argument) {
   const root = path.resolve(String(installRoot ?? ''));
   const launcher = path.join(root, 'ArchipelagoLauncher.exe');
   await fs.access(launcher);
-  const child = spawn(launcher, argument ? [argument] : [], { cwd: root, detached: true, stdio: 'ignore', windowsHide: false });
+  // Frozen Archipelago components resolve Kivy and other bundled resources from
+  // the installation directory, even when their input file lives elsewhere.
+  const child = spawn(launcher, argument ? [argument] : [], {
+    cwd: root,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: false,
+    env: { ...process.env, KIVY_DATA_DIR: path.join(root, 'data') },
+  });
   child.unref();
   return { ok: true };
 }
@@ -299,6 +411,354 @@ ipcMain.handle('tools:launch-component', ipcResult(async (payload) => {
   if (!components.some((component) => component.displayName === displayName)) throw new Error('That APWorld tool is no longer installed. Refresh Tools and try again.');
   return launchArchipelagoLauncher(payload.installRoot, displayName);
 }));
+
+ipcMain.handle('rooms:inspect', ipcResult(async (payload) => {
+  try {
+    const status = await rooms.refreshRoom(net, payload?.url, Boolean(payload?.wake));
+    return { ...status, provider: { type: 'official', roomUrl: status.url } };
+  } catch (officialError) {
+    let invitation;
+    try { invitation = rooms.parseControllerInvite(payload?.url); }
+    catch { throw officialError; }
+    const status = await rooms.refreshControllerRoom(net, invitation.url);
+    return { ...status, provider: { type: 'controller', roomUrl: invitation.url, apiVersion: 1 } };
+  }
+}));
+ipcMain.handle('rooms:take-invite', () => {
+  const invite = pendingRoomInvite;
+  pendingRoomInvite = undefined;
+  return invite ?? null;
+});
+ipcMain.handle('rooms:ensure', ipcResult(async (payload) => ({ folderPath: await rooms.ensureRoom(payload?.roomsRoot, payload?.label, payload?.roomId) })));
+ipcMain.handle('rooms:adopt-local', ipcResult(async (payload) => rooms.adoptLocalRun(payload)));
+ipcMain.handle('rooms:list-files', ipcResult(async (payload) => {
+  const folder = rooms.inside(payload?.roomsRoot, payload?.folderPath);
+  const downloads = await rooms.listFiles(path.join(folder, 'downloads', rooms.safeName(payload?.slotName, `slot-${payload?.slot}`)), 'downloaded');
+  const slotFolder = path.join(folder, 'play', rooms.safeName(payload?.slotName, `slot-${payload?.slot}`));
+  const play = await rooms.listFiles(slotFolder, 'generated');
+  return { downloads, play };
+}));
+ipcMain.handle('rooms:download-slot', ipcResult(async (payload) => {
+  if (payload?.provider?.type === 'controller') return rooms.downloadControllerSlot(net, payload);
+  if (payload?.provider?.type === 'local') throw new Error('Local room files are already available in this workspace.');
+  return rooms.downloadSlot(net, payload);
+}));
+ipcMain.handle('rooms:import-file', ipcResult(async (payload) => {
+  const result = await dialog.showOpenDialog({ title: `Add a file for ${String(payload?.slotName ?? 'room slot')}`, properties: ['openFile'] });
+  if (result.canceled || !result.filePaths[0]) return { ok: false, canceled: true };
+  return { files: await rooms.importFile(result.filePaths[0], payload) };
+}));
+
+function shareBaseUrl(config, gateway, externalIp) {
+  if (gateway.mode === 'managed') return `https://${gateway.hostname}`;
+  if (gateway.mode === 'external') {
+    const url = new URL(String(gateway.publicBaseUrl));
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error('Public portal URL must be an HTTP or HTTPS origin without a path.');
+    if (url.protocol !== 'https:') throw new Error('The external public portal URL must use HTTPS.');
+    return url.toString().replace(/\/$/, '');
+  }
+  const host = String(config.advertisedHost || externalIp || '').trim();
+  if (!host) throw new Error('Enter a public hostname or enable automatic port mapping so Controller can discover one.');
+  return `http://${host}:${Number(config.portalPort)}`;
+}
+
+function shareInvites(baseUrl, roomId) {
+  const browserUrl = `${baseUrl}/room/${roomId}`;
+  return { browserUrl, controllerUrl: `archipelago-controller://join?url=${encodeURIComponent(browserUrl)}` };
+}
+
+async function publishShareStatus(status) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:share-status', status);
+}
+
+ipcMain.handle('rooms:start-sharing', ipcResult(async (payload) => {
+  if (activeShare && activeShare.roomId !== payload?.roomId) throw new Error('Stop sharing the current room before sharing another one.');
+  const roomId = String(payload?.roomId ?? '');
+  if (!/^[A-Za-z0-9_-]{6,100}$/.test(roomId)) throw new Error('Invalid local room identifier.');
+  const portalPort = Number(payload?.hosted?.portalPort);
+  const gamePort = Number(payload?.hosted?.gamePort);
+  const gateway = payload?.gateway ?? { mode: 'local' };
+  if (![portalPort, gamePort].every((port) => Number.isInteger(port) && port > 0 && port <= 65535) || portalPort === gamePort) throw new Error('Choose distinct valid game and portal ports.');
+  if (!['managed', 'external', 'direct'].includes(gateway.mode)) throw new Error('Configure public room sharing in Settings before sharing this room.');
+  if (gateway.mode === 'direct' && !payload?.hosted?.insecureHttpAccepted) throw new Error('Acknowledge direct HTTP sharing before starting the portal.');
+  if (gateway.mode === 'external' && !String(gateway.publicBaseUrl ?? '').startsWith('https://')) throw new Error('Configure an HTTPS public portal URL in Settings.');
+  const slots = await rooms.sharedSlotInventory(payload);
+  if (!slots.length) throw new Error('This room has no player slots to share.');
+  const portalConfig = {
+    roomId, label: String(payload.label || 'Archipelago Room'), generationId: String(payload.hosted.historyRunId || ''),
+    createdAt: String(payload.createdAt || ''), passwordRequired: Boolean(payload.passwordRequired),
+    portalPort, automaticPortMapping: Boolean(payload.hosted.automaticPortMapping), slots,
+    bindHost: gateway.mode === 'managed' ? '127.0.0.1' : '0.0.0.0',
+    mappingPorts: gateway.mode === 'managed' ? [80, 443, 38281, gamePort] : gateway.mode === 'external' ? [gamePort] : [portalPort, gamePort],
+    serverRunning: Boolean(activeHost && activeHost.exitCode === null && activeHostMeta?.roomId === roomId),
+    endpoint: { host: String(payload.hosted.advertisedHost || ''), port: gateway.mode === 'managed' ? 443 : gamePort, secure: gateway.mode === 'managed' },
+  };
+  await publishShareStatus({ roomId, state: 'starting', serverRunning: portalConfig.serverRunning, portalRunning: false, mapping: portalConfig.automaticPortMapping ? 'starting' : 'disabled', reachability: 'unknown' });
+  let managedGatewayStarted = false;
+  const startManagedGateway = gateway.mode === 'managed' ? async () => {
+    gatewayStatus = { gateway: 'starting', certificate: 'obtaining' };
+    await publishShareStatus({ roomId, portalRunning: true, ...gatewayStatus });
+    await httpsGateway.start({ hostname: gateway.hostname, email: gateway.email, upstreamPort: portalPort, gamePort, compatibilityBindHost: localAddress(), compatibilityPort: 38281 });
+    managedGatewayStarted = true;
+  } : undefined;
+  let result;
+  let baseUrl;
+  try {
+    gatewayStatus = gateway.mode === 'managed' ? { gateway: 'starting', certificate: 'obtaining' } : { gateway: gateway.mode === 'external' ? 'online' : 'disabled', certificate: gateway.mode === 'external' ? 'ready' : 'unused' };
+    result = await roomPortal.start(portalConfig, startManagedGateway);
+    if (trackerSidecar.roomId === roomId) roomPortal.updateTracker(trackerSidecar.snapshot());
+    if (gateway.mode === 'managed' && !managedGatewayStarted) throw new Error('Managed HTTPS did not start.');
+    baseUrl = shareBaseUrl(payload.hosted, gateway, result.externalIp);
+    portalConfig.endpoint.host ||= String(payload.hosted.advertisedHost || gateway.hostname || result.externalIp || new URL(baseUrl).hostname || '');
+    if (!portalConfig.endpoint.host) throw new Error('Controller could not determine the public game-server hostname.');
+  } catch (error) {
+    await httpsGateway.stop();
+    await roomPortal.stop();
+    throw error;
+  }
+  activeShare = { roomId, baseUrl, portalConfig, result };
+  const status = { roomId, state: 'sharing', serverRunning: portalConfig.serverRunning, portalRunning: true, mapping: result.mapping, reachability: 'unknown', publicUrl: `${baseUrl}/room/${roomId}`, secureGameEndpoint: gateway.mode === 'managed' ? `${portalConfig.endpoint.host}:443` : undefined, compatibilityGameEndpoint: gateway.mode === 'managed' ? `${portalConfig.endpoint.host}:38281` : undefined, error: result.mappingError, ...gatewayStatus };
+  await publishShareStatus(status);
+  return { ...status, advertisedHost: portalConfig.endpoint.host, mappingMethod: result.mappingMethod };
+}));
+
+ipcMain.handle('rooms:stop-sharing', ipcResult(async (payload) => {
+  if (activeShare && payload?.roomId && activeShare.roomId !== payload.roomId) throw new Error('That room is not currently being shared.');
+  const roomId = activeShare?.roomId ?? payload?.roomId;
+  await httpsGateway.stop();
+  await roomPortal.stop();
+  gatewayStatus = { gateway: 'disabled', certificate: 'unused' };
+  activeShare = null;
+  const status = { roomId, state: 'offline', serverRunning: Boolean(activeHost && activeHost.exitCode === null && activeHostMeta?.roomId === roomId), portalRunning: false, mapping: 'disabled', reachability: 'unknown' };
+  await publishShareStatus(status);
+  return status;
+}));
+
+ipcMain.handle('rooms:copy-invite', ipcResult(async (payload) => {
+  if (!activeShare || activeShare.roomId !== payload?.roomId) throw new Error('Start sharing this room first.');
+  const invites = shareInvites(activeShare.baseUrl, activeShare.roomId);
+  clipboard.writeText(payload?.kind === 'controller' ? invites.controllerUrl : invites.browserUrl);
+  return { copied: true };
+}));
+
+ipcMain.handle('rooms:open-share', ipcResult(async (payload) => {
+  if (!activeShare || activeShare.roomId !== payload?.roomId) throw new Error('Start sharing this room first.');
+  await shell.openExternal(shareInvites(activeShare.baseUrl, activeShare.roomId).browserUrl);
+  return { opened: true };
+}));
+
+ipcMain.handle('rooms:share-status', () => activeShare ? {
+  roomId: activeShare.roomId, state: 'sharing', serverRunning: activeShare.portalConfig.serverRunning,
+  portalRunning: roomPortal.running, mapping: activeShare.result.mapping, reachability: 'unknown', publicUrl: `${activeShare.baseUrl}/room/${activeShare.roomId}`, secureGameEndpoint: activeShare.portalConfig.endpoint.secure ? `${activeShare.portalConfig.endpoint.host}:${activeShare.portalConfig.endpoint.port}` : undefined, compatibilityGameEndpoint: activeShare.portalConfig.endpoint.secure ? `${activeShare.portalConfig.endpoint.host}:38281` : undefined, ...gatewayStatus,
+} : { state: 'offline', serverRunning: Boolean(activeHost && activeHost.exitCode === null), portalRunning: false, mapping: 'disabled', reachability: 'unknown' });
+
+async function currentRoomStatus(payload) {
+  const provider = payload?.provider;
+  let status;
+  if (provider?.type === 'local') {
+    if (!activeHostMeta || activeHostMeta.roomId !== payload?.roomId || !activeHost || activeHost.exitCode !== null) throw new Error('Start this local room server first.');
+    status = { lastPort: activeHostMeta.port, endpoint: { host: 'localhost', port: activeHostMeta.port, secure: false }, refreshedAt: new Date().toISOString(), stale: false };
+  } else if (provider?.type === 'controller') {
+    status = await rooms.refreshControllerRoom(net, provider.roomUrl || payload?.roomUrl);
+  } else {
+    status = await rooms.refreshRoom(net, provider?.roomUrl || payload?.roomUrl, true);
+  }
+  if (!status.lastPort || !status.endpoint && provider?.type === 'controller') throw new Error('The room has no active server endpoint.');
+  return status;
+}
+
+function endpointFor(status) {
+  return status.endpoint ?? { host: ROOM_HOST, port: status.lastPort, secure: true };
+}
+
+ipcMain.handle('rooms:launch-file', ipcResult(async (payload) => {
+  const status = await currentRoomStatus(payload);
+  const endpoint = endpointFor(status);
+  const prepared = await rooms.prepareFile(payload, `${endpoint.host}:${endpoint.port}`);
+  const components = await inventoryLauncherComponents(payload?.installRoot);
+  const capability = resolveLauncherClient(components, payload?.game);
+  await launchArchipelagoLauncher(payload?.installRoot, prepared.file.path);
+  if (payload?.autoConnect && capability.supportsUri) {
+    const password = await getSecret(payload?.passwordRef);
+    const uri = rooms.connectionUri(payload?.slotName, password, endpoint.host, endpoint.port, capability.gameName ?? payload?.game);
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    await launchArchipelagoLauncher(payload?.installRoot, uri);
+  }
+  return { ...prepared, status, capability };
+}));
+
+ipcMain.handle('rooms:launch-client', ipcResult(async (payload) => {
+  const status = await currentRoomStatus(payload);
+  const endpoint = endpointFor(status);
+  const components = await inventoryLauncherComponents(payload?.installRoot);
+  const capability = resolveLauncherClient(components, payload?.game);
+  const password = await getSecret(payload?.passwordRef);
+  const uri = rooms.connectionUri(payload?.slotName, password, endpoint.host, endpoint.port, capability.gameName ?? payload?.game);
+  await launchArchipelagoLauncher(payload?.installRoot, uri);
+  return { status, capability };
+}));
+
+ipcMain.handle('rooms:open-tracker', ipcResult(async (payload) => {
+  if (payload?.provider?.type !== 'official' && payload?.provider) throw new Error('This room does not currently provide a WebHost tracker.');
+  const url = rooms.trackerUrl(payload?.roomUrl, payload?.trackerId, payload?.slot);
+  await shell.openExternal(url);
+  return { url };
+}));
+
+ipcMain.handle('rooms:open-sphere-tracker', ipcResult(async (payload) => {
+  if (payload?.provider?.type !== 'official' && payload?.provider) throw new Error('This room does not currently provide a sphere tracker.');
+  const url = rooms.sphereTrackerUrl(payload?.roomUrl, payload?.trackerId);
+  await shell.openExternal(url);
+  return { url };
+}));
+
+async function trackerJson(url) {
+  const response = await net.fetch(url, { method: 'GET' });
+  if (!response.ok) throw new Error(`Archipelago tracker returned HTTP ${response.status}.`);
+  return response.json();
+}
+
+async function createTrackerWorkspace(payload) {
+  const slotName = String(payload?.slotName ?? '').trim();
+  const game = String(payload?.game ?? '').trim();
+  if (!slotName || slotName.length > 64 || !game || game.length > 120) throw new Error('A valid room slot and game are required for Universal Tracker.');
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'archipelago-controller-ut-'));
+  try {
+    const playerFolder = path.join(workspace, 'Players');
+    await fs.mkdir(playerFolder, { recursive: true });
+    let document = { name: slotName, game, [game]: {} };
+    const yamlContent = String(payload?.yamlContent ?? '');
+    if (yamlContent.length > 2 * 1024 * 1024) throw new Error('The selected tracker YAML is too large.');
+    if (yamlContent.trim()) {
+      const parsed = YAML.parse(yamlContent);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('The selected tracker YAML is invalid.');
+      document = { ...parsed, name: slotName, game };
+    }
+    await fs.writeFile(path.join(playerFolder, 'ControllerTracker.yaml'), YAML.stringify(document), 'utf8');
+    await fs.writeFile(path.join(workspace, 'host.yaml'), YAML.stringify({ universal_tracker: { player_files_path: playerFolder, display_glitched_logic: true } }), 'utf8');
+    return { workspace, templateUsed: Boolean(yamlContent.trim()) };
+  } catch (error) {
+    await fs.rm(workspace, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+ipcMain.handle('rooms:tracker-dashboard', ipcResult(async (payload) => {
+  if (payload?.provider?.type === 'local') {
+    if (!trackerSidecar.running || trackerSidecar.roomId !== payload?.roomId) throw new Error('Start this room server to enable its live tracker.');
+    return trackerSidecar.snapshot();
+  }
+  if (payload?.provider?.type !== 'official' && payload?.provider) throw new Error('Live tracker data is not enabled for this room provider yet.');
+  const room = rooms.parseRoomUrl(payload?.roomUrl);
+  const trackerId = String(payload?.trackerId ?? '');
+  if (!/^[A-Za-z0-9_-]{6,100}$/.test(trackerId)) throw new Error('This room has no tracker data yet.');
+  const [dynamic, fixed] = await Promise.all([
+    trackerJson(`${room.origin}/api/tracker/${trackerId}`),
+    trackerJson(`${room.origin}/api/static_tracker/${trackerId}`),
+  ]);
+  const packages = {};
+  await Promise.all(Object.entries(fixed?.datapackage ?? {}).map(async ([game, descriptor]) => {
+    const checksum = String(descriptor?.checksum ?? '');
+    if (!/^[a-f0-9]{32,64}$/i.test(checksum)) return;
+    if (!trackerPackageCache.has(checksum)) trackerPackageCache.set(checksum, trackerJson(`${room.origin}/api/datapackage/${checksum}`));
+    try { packages[game] = await trackerPackageCache.get(checksum); }
+    catch (error) { trackerPackageCache.delete(checksum); throw error; }
+  }));
+  return rooms.normalizeTrackerDashboard(dynamic, fixed, payload?.slots, packages);
+}));
+
+ipcMain.handle('rooms:launch-universal-tracker', ipcResult(async (payload) => {
+  const status = await currentRoomStatus(payload);
+  const endpoint = endpointFor(status);
+  const components = await inventoryLauncherComponents(payload?.installRoot);
+  if (!components.some((component) => component.displayName === 'Universal Tracker')) throw new Error('Universal Tracker is not installed. Add tracker.apworld in APWorlds first.');
+  const password = await getSecret(payload?.passwordRef);
+  const uri = rooms.connectionUri(payload?.slotName, password, endpoint.host, endpoint.port, payload?.game);
+  const root = path.resolve(String(payload?.installRoot ?? ''));
+  const launcher = path.join(root, 'ArchipelagoLauncher.exe');
+  await fs.access(launcher);
+  const { workspace, templateUsed } = await createTrackerWorkspace(payload);
+  const child = spawn(launcher, ['Universal Tracker', '--', uri], { cwd: workspace, detached: true, stdio: 'ignore', windowsHide: false });
+  child.once('close', () => setTimeout(() => void fs.rm(workspace, { recursive: true, force: true }), 1000));
+  child.once('error', () => void fs.rm(workspace, { recursive: true, force: true }));
+  child.unref();
+  return { status, templateUsed };
+}));
+
+ipcMain.handle('rooms:analyze-universal-tracker', ipcResult(async (payload) => {
+  const status = await currentRoomStatus(payload);
+  const endpoint = endpointFor(status);
+  const components = await inventoryLauncherComponents(payload?.installRoot);
+  if (!components.some((component) => component.displayName === 'Universal Tracker')) throw new Error('Universal Tracker is not installed. Add tracker.apworld in APWorlds first.');
+  const password = await getSecret(payload?.passwordRef);
+  const uri = rooms.connectionUri(payload?.slotName, password, endpoint.host, endpoint.port, payload?.game);
+  const root = path.resolve(String(payload?.installRoot ?? ''));
+  const launcher = path.join(root, 'ArchipelagoLauncherDebug.exe');
+  await fs.access(launcher);
+  const { workspace, templateUsed } = await createTrackerWorkspace(payload);
+  activeGeneratorJobs += 1;
+  try {
+    const output = await new Promise((resolve, reject) => {
+      const child = spawn(launcher, ['Universal Tracker', '--', '--nogui', '--count', '--list', uri], { cwd: workspace, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      let text = '';
+      const append = (chunk) => { if (text.length < 4 * 1024 * 1024) text += chunk.toString(); };
+      child.stdout.on('data', append);
+      child.stderr.on('data', append);
+      const timer = setTimeout(() => { child.kill(); reject(new Error('Universal Tracker analysis timed out after 180 seconds.')); }, 180_000);
+      child.once('error', (error) => { clearTimeout(timer); reject(error); });
+      child.once('close', () => { clearTimeout(timer); resolve(text); });
+    });
+    const sanitized = password ? String(output).split(password).join('[redacted]') : String(output);
+    return { status, templateUsed, analyzedAt: new Date().toISOString(), ...parseUniversalTrackerOutput(sanitized) };
+  } finally {
+    activeGeneratorJobs -= 1;
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+}));
+ipcMain.handle('poptracker:inventory', ipcResult((executablePath) => inventoryPopTracker(executablePath)));
+ipcMain.handle('rooms:launch-poptracker', ipcResult(async (payload) => {
+  const inventory = await inventoryPopTracker(payload?.executablePath);
+  const pack = inventory.packs.find((item) => item.uid === payload?.packUid);
+  if (!pack) throw new Error('The associated PopTracker pack is no longer installed.');
+  const status = await currentRoomStatus(payload);
+  const endpoint = endpointFor(status);
+  const password = await getSecret(payload?.passwordRef);
+  const args = popTrackerArgs(pack, payload?.variant, {
+    host: `${endpoint.host}:${endpoint.port}`,
+    slot: String(payload?.slotName ?? ''),
+    password,
+  });
+  const executable = path.resolve(String(payload?.executablePath ?? ''));
+  const child = spawn(executable, args, { cwd: path.dirname(executable), detached: true, stdio: 'ignore', windowsHide: false });
+  child.unref();
+  return { status, pack: { uid: pack.uid, name: pack.name, version: pack.version }, variant: payload?.variant };
+}));
+
+ipcMain.handle('rooms:launch-profile', ipcResult(async (payload) => {
+  const status = await currentRoomStatus(payload);
+  const endpoint = endpointFor(status);
+  const roomFolder = rooms.inside(payload?.roomsRoot, payload?.roomFolder);
+  const slotName = String(payload?.slotName ?? '').trim();
+  if (!path.isAbsolute(roomFolder) || !slotName || slotName.length > 100) throw new Error('Invalid room launch context.');
+  const selectedFile = payload?.selectedFile ? path.resolve(String(payload.selectedFile)) : '';
+  if (selectedFile && !rooms.inside(roomFolder, selectedFile)) throw new Error('The selected launch file is outside this room.');
+  const slotFolder = path.join(roomFolder, 'play', rooms.safeName(slotName, 'slot'));
+  const context = {
+    server: endpoint.host,
+    port: endpoint.port,
+    endpoint: `${endpoint.host}:${endpoint.port}`,
+    slot: slotName,
+    game: String(payload?.game ?? ''),
+    roomUrl: String(payload?.roomUrl ?? ''),
+    roomFolder,
+    slotFolder,
+    selectedFile,
+  };
+  const result = await launchProfile(payload?.profile, context, { openExternal: (url) => shell.openExternal(url), openPath: (target) => shell.openPath(target), spawn }, payload?.stage);
+  return { status, launched: result.launched, deferred: result.deferred };
+}));
+
+ipcMain.handle('minecraft:inventory', ipcResult(() => inventoryMinecraftLauncher()));
 
 ipcMain.handle('tools:open-patch', ipcResult(async (installRoot) => {
   const result = await dialog.showOpenDialog({
@@ -329,8 +789,22 @@ function printJsonText(packet) {
     : '';
 }
 
+function scheduleRemoteReconnect(session, message) {
+  if (remoteConsole !== session || session.manualClose || quitting) return;
+  session.state = 'disconnected';
+  sendRemoteStatus(session.sender, 'disconnected', message);
+  const delay = Math.min(30, 5 * (2 ** session.retry++));
+  sendConsole(session.sender, 'remote', `${message} Reconnecting in ${delay} seconds...`, 'error');
+  session.reconnectTimer = setTimeout(() => void openRemoteConsole(session).catch((error) => scheduleRemoteReconnect(session, `Reconnect failed: ${error.message}.`)), delay * 1000);
+}
+
 async function openRemoteConsole(session) {
   if (remoteConsole !== session || session.manualClose) return;
+  if (session.profile.roomUrl) {
+    const status = await currentRoomStatus({ roomUrl: session.profile.roomUrl, provider: session.profile.roomProvider, roomId: session.profile.roomId });
+    const endpoint = endpointFor(status);
+    session.profile.address = `${endpoint.host}:${endpoint.port}`;
+  }
   const url = remoteUrl(session.profile.address);
   session.state = 'connecting';
   sendRemoteStatus(session.sender, 'connecting', url);
@@ -390,9 +864,7 @@ async function openRemoteConsole(session) {
       remoteConsole = null;
       return;
     }
-    const delay = Math.min(30, 5 * (2 ** session.retry++));
-    sendConsole(session.sender, 'remote', `Connection lost. Reconnecting in ${delay} seconds...`, 'error');
-    session.reconnectTimer = setTimeout(() => void openRemoteConsole(session), delay * 1000);
+    scheduleRemoteReconnect(session, 'Connection lost.');
   });
 }
 
@@ -501,6 +973,7 @@ ipcMain.handle('history:scan-existing', async (_event, payload) => {
       if (seed && hostedSeeds.has(seed)) continue;
       const artifact = path.join(payload.outputRoot, file.name);
       const stats = await fs.stat(artifact);
+      const summary = await rooms.archiveSlotSummary(artifact);
       runs.push({
         importKey: seed ? `seed:${seed}` : `artifact:${artifact.toLowerCase()}`,
         name: seed ? `Seed ${seed}` : path.basename(file.name, '.zip'),
@@ -509,10 +982,7 @@ ipcMain.handle('history:scan-existing', async (_event, payload) => {
         artifactPath: artifact,
         savePath: null,
         seed,
-        playerCount: 0,
-        slotCount: 0,
-        games: [],
-        slots: [],
+        ...summary,
       });
     }
   } catch { /* An optional output folder may not exist yet. */ }
@@ -598,18 +1068,20 @@ ipcMain.handle('session:generate', async (event, payload) => {
   const args = tokenizeArgs(payload.generatorArgs, { input, output, root });
   activeGeneratorJobs += 1;
   let result;
+  let artifactPath;
   try { result = await runProcess(generatorPath, args, event.sender, root); }
   finally { activeGeneratorJobs -= 1; }
   if (result.ok) {
     const zip = await firstMatchingFile(output, ['.zip']);
     if (zip) {
+      artifactPath = zip;
       const unpacked = path.join(root, 'unpacked');
       await fs.mkdir(unpacked, { recursive: true });
       await extractZip(zip, unpacked);
       event.sender.send('process:log', `Unpacked ${path.basename(zip)} to ${unpacked}\n`);
     }
   }
-  return { ...result, outputPath: root };
+  return { ...result, outputPath: root, artifactPath };
 });
 
 ipcMain.handle('session:dry-run', async (event, payload) => {
@@ -672,25 +1144,44 @@ ipcMain.handle('session:host', async (event, payload) => {
   return new Promise((resolve) => {
     const child = spawn(hostPath, args, { windowsHide: true, cwd: workingDirectory });
     activeHost = child;
+    activeHostMeta = { roomId: payload.roomId || null, port: Number(settings.port) || 38281, sessionPath: payload.sessionPath, savePath: payload.savePath || settings.savefile || null };
     child.stdout.on('data', (chunk) => sendHostOutput(event.sender, chunk, 'message'));
     child.stderr.on('data', (chunk) => sendHostOutput(event.sender, chunk, 'error'));
     child.once('spawn', () => {
-      event.sender.send('host:status', { running: true, pid: child.pid });
-      resolve({ ok: true, pid: child.pid });
+      if (activeHostMeta.roomId && Array.isArray(payload.slots) && payload.slots.length) {
+        trackerSidecar.start({ roomId: activeHostMeta.roomId, port: activeHostMeta.port, password: roomPassword, slots: payload.slots });
+      }
+      if (activeShare?.roomId === activeHostMeta.roomId) {
+        activeShare.portalConfig.serverRunning = true;
+        void publishShareStatus({ roomId: activeShare.roomId, state: 'sharing', serverRunning: true, portalRunning: true, mapping: activeShare.result.mapping, reachability: 'unknown', publicUrl: `${activeShare.baseUrl}/room/${activeShare.roomId}` });
+      }
+      event.sender.send('host:status', { running: true, pid: child.pid, roomId: activeHostMeta.roomId, port: activeHostMeta.port, savePath: activeHostMeta.savePath });
+      resolve({ ok: true, pid: child.pid, roomId: activeHostMeta.roomId, port: activeHostMeta.port });
     });
     child.once('error', (error) => {
+      trackerSidecar.stop();
+      roomPortal.updateTracker(undefined);
       activeHost = null;
+      activeHostMeta = null;
       event.sender.send('host:status', { running: false, error: error.message });
       resolve({ ok: false, error: error.message });
     });
     child.once('close', (exitCode) => {
+      const stoppedRoomId = activeHostMeta?.roomId;
       activeHost = null;
-      if (!event.sender.isDestroyed()) event.sender.send('host:status', { running: false, exitCode });
+      activeHostMeta = null;
+      trackerSidecar.stop();
+      roomPortal.updateTracker(undefined);
+      if (activeShare?.roomId === stoppedRoomId) {
+        activeShare.portalConfig.serverRunning = false;
+        void publishShareStatus({ roomId: activeShare.roomId, state: 'sharing', serverRunning: false, portalRunning: true, mapping: activeShare.result.mapping, reachability: 'unknown', publicUrl: `${activeShare.baseUrl}/room/${activeShare.roomId}` });
+      }
+      if (!event.sender.isDestroyed()) event.sender.send('host:status', { running: false, exitCode, roomId: stoppedRoomId });
     });
   });
 });
 
-ipcMain.handle('session:host-status', () => ({ running: Boolean(activeHost && activeHost.exitCode === null), pid: activeHost?.pid ?? null }));
+ipcMain.handle('session:host-status', () => ({ running: Boolean(activeHost && activeHost.exitCode === null), pid: activeHost?.pid ?? null, ...activeHostMeta }));
 
 ipcMain.handle('session:host-input', (event, raw) => {
   const text = String(raw ?? '').trim();
