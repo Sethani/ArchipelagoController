@@ -13,6 +13,7 @@ const { readHostConfig, writeHostConfig } = require('./host-config.cjs');
 const rooms = require('./rooms.cjs');
 const { createRoomPortal, localAddress } = require('./room-portal.cjs');
 const { createHttpsGateway } = require('./https-gateway.cjs');
+const { createGatewayFirewall } = require('./gateway-firewall.cjs');
 const { inventoryPopTracker, popTrackerArgs } = require('./poptracker.cjs');
 const { actionFromShortcut, launchProfile } = require('./game-launch.cjs');
 const { inventoryMinecraftLauncher } = require('./minecraft-launcher.cjs');
@@ -31,7 +32,7 @@ let mainWindow = null;
 let activeGeneratorJobs = 0;
 let validationBusy = false;
 let activeShare = null;
-let gatewayStatus = { gateway: 'disabled', certificate: 'unused' };
+let gatewayStatus = { gateway: 'disabled', certificate: 'unused', firewall: 'unused' };
 let pendingRoomInvite = process.argv.find((value) => /^archipelago-controller:\/\/join/i.test(value));
 const trackerPackageCache = new Map();
 const roomPortal = createRoomPortal({
@@ -44,6 +45,12 @@ const trackerSidecar = createTrackerSidecar({
   createSocket: (url) => new net.WebSocket(url),
   onUpdate: (snapshot) => {
     if (activeShare?.roomId === snapshot.roomId) roomPortal.updateTracker(snapshot);
+  },
+});
+const gatewayFirewall = createGatewayFirewall({
+  spawn,
+  onLog: (line) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('process:log', `[Firewall] ${line}\n`);
   },
 });
 const httpsGateway = createHttpsGateway({
@@ -170,6 +177,7 @@ function createWindow() {
     minWidth: 1040,
     minHeight: 700,
     backgroundColor: '#18201e',
+    icon: path.join(__dirname, '..', isDev ? 'build' : 'dist', 'icon.png'),
     titleBarStyle: 'hiddenInset',
     show: !isSmoke,
     webPreferences: {
@@ -494,9 +502,39 @@ ipcMain.handle('rooms:start-sharing', ipcResult(async (payload) => {
     endpoint: { host: String(payload.hosted.advertisedHost || ''), port: gateway.mode === 'managed' ? 443 : gamePort, secure: gateway.mode === 'managed' },
   };
   await publishShareStatus({ roomId, state: 'starting', serverRunning: portalConfig.serverRunning, portalRunning: false, mapping: portalConfig.automaticPortMapping ? 'starting' : 'disabled', reachability: 'unknown' });
+  if (gateway.mode === 'managed') {
+    gatewayStatus = { gateway: 'starting', certificate: 'unused', firewall: 'checking' };
+    await publishShareStatus({ roomId, portalRunning: false, ...gatewayStatus });
+    try {
+      const firewallInspection = await gatewayFirewall.inspect();
+      if (firewallInspection.state === 'required') {
+        const options = {
+          type: 'warning',
+          title: 'Allow managed room sharing',
+          message: 'Controller needs durable Windows Firewall rules before it can share this room.',
+          detail: `This opens inbound TCP ports ${firewallInspection.missing.map((rule) => rule.port).join(', ')} on Private and Public network profiles. The rules are limited to Archipelago Controller's managed gateway ports and remain available across portable-app restarts. Windows will ask for administrator approval next.`,
+          buttons: ['Cancel', 'Allow gateway ports'],
+          defaultId: 1,
+          cancelId: 0,
+          noLink: true,
+        };
+        const confirmation = mainWindow && !mainWindow.isDestroyed()
+          ? await dialog.showMessageBox(mainWindow, options)
+          : await dialog.showMessageBox(options);
+        if (confirmation.response !== 1) throw new Error('Room sharing was cancelled before changing Windows Firewall.');
+      }
+      await gatewayFirewall.ensure();
+      gatewayStatus = { ...gatewayStatus, firewall: 'ready' };
+      await publishShareStatus({ roomId, portalRunning: false, ...gatewayStatus });
+    } catch (error) {
+      gatewayStatus = { gateway: 'error', certificate: 'unused', firewall: 'error', gatewayError: error instanceof Error ? error.message : String(error) };
+      await publishShareStatus({ roomId, portalRunning: false, ...gatewayStatus });
+      throw error;
+    }
+  }
   let managedGatewayStarted = false;
   const startManagedGateway = gateway.mode === 'managed' ? async () => {
-    gatewayStatus = { gateway: 'starting', certificate: 'obtaining' };
+    gatewayStatus = { ...gatewayStatus, gateway: 'starting', certificate: 'obtaining', gatewayError: undefined };
     await publishShareStatus({ roomId, portalRunning: true, ...gatewayStatus });
     await httpsGateway.start({ hostname: gateway.hostname, email: gateway.email, upstreamPort: portalPort, gamePort, compatibilityBindHost: localAddress(), compatibilityPort: 38281 });
     managedGatewayStarted = true;
@@ -504,7 +542,7 @@ ipcMain.handle('rooms:start-sharing', ipcResult(async (payload) => {
   let result;
   let baseUrl;
   try {
-    gatewayStatus = gateway.mode === 'managed' ? { gateway: 'starting', certificate: 'obtaining' } : { gateway: gateway.mode === 'external' ? 'online' : 'disabled', certificate: gateway.mode === 'external' ? 'ready' : 'unused' };
+    gatewayStatus = gateway.mode === 'managed' ? { ...gatewayStatus, gateway: 'starting', certificate: 'obtaining' } : { gateway: gateway.mode === 'external' ? 'online' : 'disabled', certificate: gateway.mode === 'external' ? 'ready' : 'unused', firewall: 'unused' };
     result = await roomPortal.start(portalConfig, startManagedGateway);
     if (trackerSidecar.roomId === roomId) roomPortal.updateTracker(trackerSidecar.snapshot());
     if (gateway.mode === 'managed' && !managedGatewayStarted) throw new Error('Managed HTTPS did not start.');
@@ -527,9 +565,9 @@ ipcMain.handle('rooms:stop-sharing', ipcResult(async (payload) => {
   const roomId = activeShare?.roomId ?? payload?.roomId;
   await httpsGateway.stop();
   await roomPortal.stop();
-  gatewayStatus = { gateway: 'disabled', certificate: 'unused' };
+  gatewayStatus = { gateway: 'disabled', certificate: 'unused', firewall: 'unused' };
   activeShare = null;
-  const status = { roomId, state: 'offline', serverRunning: Boolean(activeHost && activeHost.exitCode === null && activeHostMeta?.roomId === roomId), portalRunning: false, mapping: 'disabled', reachability: 'unknown' };
+  const status = { roomId, state: 'offline', serverRunning: Boolean(activeHost && activeHost.exitCode === null && activeHostMeta?.roomId === roomId), portalRunning: false, mapping: 'disabled', reachability: 'unknown', ...gatewayStatus };
   await publishShareStatus(status);
   return status;
 }));

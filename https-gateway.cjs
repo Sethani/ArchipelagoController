@@ -1,5 +1,6 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { isIP } = require('node:net');
 
 const HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -9,15 +10,25 @@ function validateGatewayConfig(raw) {
   const email = String(raw?.email ?? '').trim();
   const upstreamPort = Number(raw?.upstreamPort);
   const gamePort = Number(raw?.gamePort);
+  const compatibilityBindHost = String(raw?.compatibilityBindHost ?? '').trim();
+  const compatibilityPort = Number(raw?.compatibilityPort ?? 38281);
   if (!HOSTNAME_PATTERN.test(hostname)) throw new Error('Enter a public DNS hostname such as rooms.example.net.');
   if (!EMAIL_PATTERN.test(email) || email.length > 254) throw new Error('Enter a valid certificate contact email.');
   if (!Number.isInteger(upstreamPort) || upstreamPort < 1 || upstreamPort > 65535) throw new Error('The room portal port is invalid.');
   if (!Number.isInteger(gamePort) || gamePort < 1 || gamePort > 65535 || gamePort === upstreamPort) throw new Error('The Archipelago game port is invalid.');
-  return { hostname, email, upstreamPort, gamePort };
+  if (compatibilityBindHost && isIP(compatibilityBindHost) !== 4) throw new Error('The compatibility listener requires a valid LAN IPv4 address.');
+  if (!Number.isInteger(compatibilityPort) || compatibilityPort < 1 || compatibilityPort > 65535 || compatibilityPort === upstreamPort) throw new Error('The compatibility WebSocket port is invalid.');
+  return { hostname, email, upstreamPort, gamePort, compatibilityBindHost, compatibilityPort };
 }
 
 function caddyfile(config) {
-  const { hostname, email, upstreamPort, gamePort } = validateGatewayConfig(config);
+  const { hostname, email, upstreamPort, gamePort, compatibilityBindHost, compatibilityPort } = validateGatewayConfig(config);
+  const compatibility = compatibilityBindHost ? `
+https://${hostname}:${compatibilityPort} {
+\tbind ${compatibilityBindHost} [::1]
+\treverse_proxy 127.0.0.1:${gamePort}
+}
+` : '';
   return `{
 \tadmin off
 \temail ${email}
@@ -34,6 +45,7 @@ ${hostname} {
 \t\tReferrer-Policy no-referrer
 \t}
 }
+${compatibility}
 `;
 }
 

@@ -32,7 +32,8 @@ input, textarea, select { color: var(--ink); letter-spacing: 0; }
 .brand-mark > div:last-child { display: flex; flex-direction: column; }
 .brand-mark strong { font-size: 14px; letter-spacing: 0; }
 .brand-mark span { color: #94a39e; font-size: 12px; margin-top: 1px; }
-.brand-icon { display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid #41645a; border-radius: 7px; color: #72d1ad; background: #20302c; }
+.brand-icon { display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid #41645a; border-radius: 8px; overflow: hidden; background: #20302c; }
+.brand-icon img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .nav-rail nav { display: flex; flex-direction: column; gap: 3px; }
 .nav-rail nav button { position: relative; display: flex; align-items: center; gap: 11px; width: 100%; height: 39px; border: 0; border-radius: 6px; padding: 0 10px; color: #9daca7; background: transparent; text-align: left; font-size: 13px; }
 .nav-rail nav button:hover { color: #eef4f1; background: #202b29; }

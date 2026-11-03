@@ -625,7 +625,7 @@ export function App() {
   return (
     <div className="app-shell" style={{ '--sidebar-width': `${sidebarWidth}px` } as React.CSSProperties}>
       <aside className={`nav-rail ${navOpen ? 'open' : ''}`}>
-        <div className="brand-mark"><div className="brand-icon"><Gamepad2 size={21} /></div><div><strong>Archipelago</strong><span>Controller</span></div></div>
+        <div className="brand-mark"><div className="brand-icon"><img src="./icon.png" alt="" /></div><div><strong>Archipelago</strong><span>Controller</span></div></div>
         <nav>{navItems.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'active' : ''} onClick={() => { setView(id); setNavOpen(false); }}><Icon size={18} /><span>{label}</span>{id === 'history' && state.history.length > 0 && <em>{state.history.length}</em>}</button>)}</nav>
         <div className="nav-status"><span className={`status-dot ${electronReady ? 'online' : ''}`} /><div><strong>{electronReady ? 'Desktop connected' : 'Browser preview'}</strong><span>{state.settings.installRoot ? 'Installation configured' : 'Setup required'}</span></div></div>
         <div className="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize navigation" title="Drag to resize navigation" onPointerDown={resizeSidebar} />

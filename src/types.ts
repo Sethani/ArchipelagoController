@@ -300,6 +300,7 @@ export type RoomShareStatus = {
   error?: string;
   gateway?: 'disabled' | 'starting' | 'online' | 'error';
   certificate?: 'unused' | 'obtaining' | 'ready' | 'error';
+  firewall?: 'unused' | 'checking' | 'ready' | 'error';
   gatewayError?: string;
   secureGameEndpoint?: string;
   compatibilityGameEndpoint?: string;
