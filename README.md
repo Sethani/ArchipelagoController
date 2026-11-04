@@ -1,5 +1,7 @@
 # Archipelago Controller
 
+The Controller-hosted room parity specification and release checklist is in [docs/0.2.0-controller-room-parity.md](docs/0.2.0-controller-room-parity.md).
+
 A host-first desktop app for organizing player YAML templates, validating session builds, generating Archipelago sessions, and returning to past runs.
 
 ## Run locally

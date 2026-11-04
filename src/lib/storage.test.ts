@@ -61,4 +61,38 @@ describe('stored host settings', () => {
     expect('accessTokenRef' in room.hosted!).toBe(false);
     expect('accessTokenSet' in room.hosted!).toBe(false);
   });
+
+  it('keeps guest-local room logic analyses across restarts', () => {
+    localStorage.setItem('archipelago-controller-state-v1', JSON.stringify({
+      ...initialState,
+      rooms: [{
+        id: 'remote-test-room', label: 'Remote room', url: 'https://rooms.example/room/remote-test-room', folderPath: 'C:\\Rooms\\Remote',
+        createdAt: '2026-11-04T00:00:00.000Z', passwordSet: false, autoLoginWarningAccepted: false,
+        provider: { type: 'controller', roomUrl: 'https://rooms.example/room/remote-test-room' },
+        slots: [{ slot: 2, name: 'Player', game: 'Minecraft', mine: true, downloadAvailable: false, files: [] }],
+        status: { refreshedAt: '2026-11-04T00:00:00.000Z', stale: true },
+        logicAnalyses: { 2: { inLogic: 10, glitched: 3, available: 13, locations: [], analyzedAt: '2026-11-04T00:00:00.000Z', templateUsed: true, environmentFingerprint: 'environment-1' } },
+      }],
+    }));
+
+    expect(loadState().rooms[0].logicAnalyses?.[2]).toMatchObject({ inLogic: 10, glitched: 3, environmentFingerprint: 'environment-1' });
+  });
+
+  it('repairs duplicate slots in saved rooms without losing files', () => {
+    localStorage.setItem('archipelago-controller-state-v1', JSON.stringify({
+      ...initialState,
+      rooms: [{
+        id: 'local-duplicate-room', label: 'Duplicate room', url: 'local://room/local-duplicate-room', folderPath: 'C:\\Rooms\\Duplicate',
+        createdAt: '2026-11-04T00:00:00.000Z', passwordSet: false, autoLoginWarningAccepted: false,
+        slots: [
+          { slot: 1, name: 'Player_MC', game: 'Minecraft', mine: true, downloadAvailable: true, files: [{ id: 'a', name: 'a.apmc', path: 'a', kind: 'downloaded', size: 1, modifiedAt: '2026-11-04T00:00:00.000Z' }] },
+          { slot: 1, name: 'Player_MC', game: 'Minecraft', mine: false, downloadAvailable: true, files: [{ id: 'b', name: 'b.apmc', path: 'b', kind: 'downloaded', size: 1, modifiedAt: '2026-11-04T00:00:00.000Z' }] },
+        ],
+        status: { refreshedAt: '2026-11-04T00:00:00.000Z', stale: true },
+      }],
+    }));
+
+    expect(loadState().rooms[0].slots).toHaveLength(1);
+    expect(loadState().rooms[0].slots[0].files.map((file) => file.id)).toEqual(['a', 'b']);
+  });
 });

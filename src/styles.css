@@ -507,6 +507,10 @@ body.resizing-layout { cursor: grabbing; user-select: none; }
 .settings-section > div:first-child small { color: var(--muted); font-size: 9px; line-height: 1.4; }
 .settings-fields { display: flex; flex-direction: column; gap: 11px; }
 .settings-fields label > small { color: #8a9591; font-weight: 400; }
+.settings-fields label.setting-checkbox { min-height: 30px; flex-direction: row; align-items: center; gap: 8px; cursor: pointer; }
+.settings-fields label.setting-checkbox > input { position: absolute; width: 1px; height: 1px; padding: 0; opacity: 0; pointer-events: none; }
+.setting-checkbox input:checked + .custom-check { border-color: var(--green); color: white; background: var(--green); }
+.setting-checkbox input:focus-visible + .custom-check { outline: 2px solid #76bea3; outline-offset: 2px; }
 .path-field { display: grid; grid-template-columns: minmax(0, 1fr) 31px; gap: 5px; }
 .path-resolution { overflow: hidden; color: #7f918b !important; font-family: Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .reset-button { margin-left: 265px; }
@@ -553,6 +557,7 @@ body.resizing-layout { cursor: grabbing; user-select: none; }
 .room-live-stats strong { font-size: 16px; }
 .room-live-stats small { color: var(--muted); font-size: 8px; }
 .room-progress-table, .room-hints-table { min-width: 760px; }
+.room-progress-filters{min-height:38px;padding:5px 10px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:7px}.room-progress-filters input{min-width:180px;flex:1}.room-progress-filters select,.room-hints-toolbar select{width:auto;min-width:130px}
 .room-progress-head, .room-progress-row { display: grid; grid-template-columns: minmax(180px, 1.2fr) minmax(120px, .75fr) 60px 84px 112px minmax(130px, .75fr); align-items: center; gap: 10px; }
 .room-progress-head, .room-hint-head { min-height: 30px; padding: 0 18px; color: #788983; background: #151e1b; font-size: 8px; font-weight: 700; text-transform: uppercase; }
 .room-progress-row { min-height: 50px; padding: 6px 18px; border-top: 1px solid #2c3935; color: #b9c5c0; font-size: 9px; }
@@ -572,12 +577,13 @@ body.resizing-layout { cursor: grabbing; user-select: none; }
 .room-player-status.status-20 { color: #a9dfca; background: #23463b; }
 .room-player-status.status-30 { color: #17211e; background: #70c6a5; }
 .room-logic-actions { display: flex; align-items: center; gap: 5px; }
+.room-logic-counts.stale{color:var(--warning)}
 .room-logic-actions > .text-button { padding: 0; }
 .room-logic-actions > .icon-button { width: 27px; height: 27px; flex: 0 0 auto; }
 .room-logic-counts { min-width: 0; display: flex; align-items: baseline; gap: 3px; color: var(--muted); font-size: 8px; white-space: nowrap; }
 .room-logic-counts b { color: #a9dfca; font-size: 10px; }
 .room-logic-counts b + b { margin-left: 4px; color: #e5bb6b; }
-.room-hints-toolbar { min-height: 36px; padding: 0 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 9px; }
+.room-hints-toolbar { min-height: 36px; padding: 0 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: flex-end; gap:10px; color: var(--muted); font-size: 9px; }.room-hints-toolbar>span:first-child{margin-right:auto}
 .room-hints-toolbar label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .room-hints-toolbar input { position: absolute; opacity: 0; }
 .room-hints-toolbar input:checked + .custom-check { border-color: var(--green); color: white; background: var(--green); }
@@ -762,3 +768,11 @@ select { color-scheme: dark; }
   .add-loadout { grid-template-columns: 1fr 1fr; }
   .add-loadout select { grid-column: 1 / -1; }
 }
+.room-tool-install,.room-remote-wake{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--line);background:var(--panel-soft)}
+.room-password-control{display:flex;align-items:center;gap:9px;padding:9px 18px;border-bottom:1px solid var(--line)}.room-password-control>span{display:flex;flex:1;flex-direction:column}.room-password-control input{width:min(320px,35vw)}
+.room-tool-install>span,.room-remote-wake>span,.room-remote-wake label>span:last-child{min-width:0;display:flex;flex:1;flex-direction:column;gap:2px}.room-tool-install small,.room-remote-wake small{color:var(--muted)}
+.room-remote-wake label{display:flex;align-items:center;gap:9px;flex:1}.room-activity-list,.room-sphere-list,.room-download-list{border:1px solid var(--line);background:var(--panel)}
+.room-activity-list>div,.room-sphere-list>div,.room-download-list>div{min-height:46px;padding:9px 12px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}.room-activity-list>div:last-child,.room-sphere-list>div:last-child,.room-download-list>div:last-child{border-bottom:0}
+.room-activity-list time{width:90px;color:var(--muted)}.room-activity-list strong,.room-sphere-list b{width:90px}.room-activity-list span,.room-sphere-list span,.room-download-list>div>span{min-width:0;flex:1;overflow-wrap:anywhere}.room-download-list>div>span{display:flex;flex-direction:column}
+.room-download-panel{display:flex;flex-direction:column;gap:8px}.room-download-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.room-download-toolbar>span{margin-right:auto;color:var(--muted)}.room-download-select{display:flex;align-items:center;flex:0 0 auto}
+.room-progress-head button{padding:0;border:0;color:inherit;background:transparent;text-align:left;text-transform:inherit;cursor:pointer}.room-progress-head button:hover{color:var(--text)}

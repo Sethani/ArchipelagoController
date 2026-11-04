@@ -2,11 +2,14 @@ const http = require('node:http');
 const os = require('node:os');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { createHash, timingSafeEqual } = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 const { createRoomLiveState } = require('./room-live-state.cjs');
 const { roomPage } = require('./room-page.cjs');
 
 const API_PREFIX = '/api/controller/v1/room/';
+const API_V2_PREFIX = '/api/controller/v2/room/';
+const SCHEMA_VERSION = '2.0.0';
 const MAX_REQUESTS_PER_MINUTE = 180;
 const MAX_ACTIVE_DOWNLOADS = 3;
 const NETWORK_OPERATION_TIMEOUT = 7000;
@@ -28,6 +31,35 @@ function json(response, status, value) {
     'x-content-type-options': 'nosniff',
   });
   response.end(body);
+}
+
+function publicJson(request, response, value) {
+  const body = Buffer.from(JSON.stringify(value));
+  const etag = `"${createHash('sha256').update(body).digest('hex')}"`;
+  const headers = {
+    'access-control-allow-origin': '*',
+    'cache-control': 'no-store',
+    'content-type': 'application/json; charset=utf-8',
+    'etag': etag,
+    'x-content-type-options': 'nosniff',
+  };
+  if (request.headers['if-none-match'] === etag) {
+    response.writeHead(304, headers);
+    return response.end();
+  }
+  response.writeHead(200, { ...headers, 'content-length': body.length });
+  response.end(body);
+}
+
+function remoteFile(file) {
+  return {
+    id: file.id,
+    sourceId: file.id,
+    revision: createHash('sha256').update(`${file.id}:${file.size}:${file.modifiedAt || ''}`).digest('hex').slice(0, 24),
+    name: file.name,
+    size: file.size,
+    kind: file.kind,
+  };
 }
 
 function page(roomId) {
@@ -100,12 +132,16 @@ async function createMapping(ports) {
   }
 }
 
-function createRoomPortal({ patchArchive, onObserved = () => {} }) {
+function createRoomPortal({ patchArchive, onObserved = () => {}, onWake = async () => ({ status: 'disabled' }) }) {
   let server;
   let mapping;
   let config;
   let liveState;
   let trackerSnapshot;
+  let sphereSnapshot;
+  let logicAnalyses = {};
+  let wakeBusy = false;
+  let lastWakeAt = 0;
   let activeDownloads = 0;
   const rate = new Map();
 
@@ -117,6 +153,8 @@ function createRoomPortal({ patchArchive, onObserved = () => {} }) {
     config = undefined;
     liveState = undefined;
     trackerSnapshot = undefined;
+    sphereSnapshot = undefined;
+    logicAnalyses = {};
   }
 
   async function start(next, onListening) {
@@ -144,18 +182,133 @@ function createRoomPortal({ patchArchive, onObserved = () => {} }) {
           response.writeHead(302, { location: `/room/${encodeURIComponent(next.roomId)}`, 'cache-control': 'no-store' });
           return response.end();
         }
-        if (!url.pathname.startsWith(`${API_PREFIX}${next.roomId}`)) return json(response, 404, { error: 'Not found.' });
+        const v2base = `${API_V2_PREFIX}${next.roomId}`;
+        const v1base = `${API_PREFIX}${next.roomId}`;
+        const isLoopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(ip);
+        const live = liveState.snapshot();
+        const tracked = trackerSnapshot;
+        const trackedPlayers = new Map((tracked?.players || []).map((player) => [player.slot, player]));
+        const trackedNames = new Map((tracked?.players || []).map((player) => [String(player.name || '').trim().toLocaleLowerCase(), player]));
+        const slots = next.slots.map((slot) => {
+          const player = live.players.find((item) => item.slot === slot.slot);
+          const trackedPlayer = trackedNames.get(String(slot.name || '').trim().toLocaleLowerCase()) ?? trackedPlayers.get(slot.slot);
+          return {
+            slot: slot.slot, name: slot.name, game: slot.game, connected: Boolean(player?.connected),
+            checksSeen: trackedPlayer?.checksDone ?? player?.checksSeen ?? 0,
+            checksTotal: trackedPlayer?.checksTotal ?? 0,
+            itemsSeen: trackedPlayer?.itemsReceived ?? player?.itemsSeen ?? 0,
+            status: trackedPlayer?.statusLabel ?? player?.status ?? 'Not connected',
+            lastActivityAt: trackedPlayer?.lastActivity ?? player?.lastActivityAt,
+            files: slot.files.map(remoteFile),
+          };
+        });
+        const capabilities = {
+          apiVersion: 2, progress: true, hints: true, activity: true,
+          spheres: Boolean(sphereSnapshot?.available), multipleFiles: true,
+          browserTrackers: true, logicAnalysis: true, remoteWake: Boolean(next.allowRemoteWake),
+        };
+        const hints = tracked?.hints?.map((hint) => ({
+          ...hint, timestamp: tracked.refreshedAt, type: hint.found ? 'Found' : 'Open',
+          message: `${hint.item} for ${hint.receivingName} at ${hint.location} (${hint.findingName})`,
+        })) ?? live.hints;
+        const snapshotTime = tracked?.refreshedAt || next.lastActivityAt || next.startedAt;
+        const dashboard = tracked ?? {
+          refreshedAt: snapshotTime, players: slots.map((slot) => ({
+            slot: slot.slot, name: slot.name, game: slot.game, checksDone: slot.checksSeen,
+            checksTotal: slot.checksTotal, itemsReceived: slot.itemsSeen, status: slot.connected ? 5 : 0,
+            statusLabel: slot.status, lastActivity: slot.lastActivityAt, hintCount: 0, unresolvedHintCount: 0,
+          })), hints, checksDone: slots.reduce((sum, slot) => sum + slot.checksSeen, 0),
+          checksTotal: slots.reduce((sum, slot) => sum + slot.checksTotal, 0), completedPlayers: live.completedPlayers,
+          unresolvedHints: hints.filter((hint) => !hint.found).length,
+        };
+        const revisionInput = JSON.stringify({ endpoint: next.endpoint, slots, dashboard, events: live.events, sphereSnapshot, logicAnalyses });
+        const snapshot = {
+          apiVersion: 2, schemaVersion: SCHEMA_VERSION, roomId: next.roomId, label: next.label,
+          generationId: next.generationId || undefined, refreshedAt: snapshotTime, stale: false,
+          original: {
+            lifecycle: next.serverRunning ? 'Online' : 'Offline', endpoint: next.endpoint, passwordRequired: Boolean(next.passwordRequired),
+            slots: slots.map(({ slot, name, game, connected, files: remoteFiles }) => ({ slot, name, game, connected, files: remoteFiles })),
+            observedAt: snapshotTime, sourceRevision: createHash('sha256').update(revisionInput).digest('hex'),
+          },
+          enriched: {
+            dashboard, hints, activity: live.events,
+            spheres: sphereSnapshot ?? { refreshedAt: snapshotTime, available: false, reason: 'absent', checks: [] },
+            logic: logicAnalyses, capabilities,
+          },
+        };
+        if (request.method === 'GET' && url.pathname === '/api/controller/v2/schema') return publicJson(request, response, {
+          $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'Archipelago Controller room snapshot',
+          type: 'object', required: ['apiVersion', 'schemaVersion', 'roomId', 'label', 'refreshedAt', 'stale', 'original', 'enriched'],
+          properties: {
+            apiVersion: { const: 2 }, schemaVersion: { type: 'string' }, roomId: { type: 'string' }, label: { type: 'string' },
+            generationId: { type: 'string' }, refreshedAt: { type: 'string', format: 'date-time' }, stale: { type: 'boolean' },
+            original: { type: 'object', required: ['lifecycle', 'slots', 'passwordRequired', 'observedAt', 'sourceRevision'] },
+            enriched: { type: 'object', required: ['dashboard', 'hints', 'activity', 'spheres', 'logic', 'capabilities'] },
+          },
+          apiVersion: 2, schemaVersion: SCHEMA_VERSION, compatibleApiVersions: [1, 2], snapshot: `${API_V2_PREFIX}{roomId}/snapshot`,
+        });
+        if (request.method === 'GET' && url.pathname === `${v2base}/status`) return publicJson(request, response, {
+          apiVersion: 2, schemaVersion: SCHEMA_VERSION, roomId: next.roomId, label: next.label,
+          generationId: next.generationId, state: snapshot.original.lifecycle, endpoint: next.endpoint,
+          passwordRequired: Boolean(next.passwordRequired), refreshedAt: snapshot.refreshedAt, createdAt: next.createdAt,
+          startedAt: next.startedAt, lastActivityAt: next.lastActivityAt,
+          capabilities, trackerCapabilities: { dashboard: true, liveEvents: true, hints: true, multitracker: true, sphere: capabilities.spheres },
+          progress: { checksSeen: dashboard.checksDone, checksTotal: dashboard.checksTotal, itemsSeen: dashboard.players.reduce((sum, player) => sum + player.itemsReceived, 0), completedPlayers: dashboard.completedPlayers, unresolvedHints: dashboard.unresolvedHints, totalsAvailable: Boolean(tracked) },
+          hints, activity: live.events, slots,
+          tools: next.tools || {},
+          wakeNonce: capabilities.remoteWake ? next.wakeNonce : undefined,
+        });
+        if (request.method === 'GET' && url.pathname === `${v2base}/snapshot`) return publicJson(request, response, snapshot);
+        if (request.method === 'GET' && url.pathname === `${v2base}/dashboard`) return publicJson(request, response, dashboard);
+        if (request.method === 'GET' && url.pathname === `${v2base}/spheres`) return publicJson(request, response, snapshot.enriched.spheres);
+        if (request.method === 'GET' && url.pathname === `${v2base}/trackers`) return publicJson(request, response, { dashboard: `/room/${next.roomId}`, multitracker: `/room/${next.roomId}`, spheres: capabilities.spheres ? `/room/${next.roomId}#spheres` : null });
+        const v2SlotMatch = url.pathname.match(new RegExp(`^${v2base}/slots/(\\d+)/files$`));
+        if (request.method === 'GET' && v2SlotMatch) {
+          const slot = slots.find((item) => item.slot === Number(v2SlotMatch[1]));
+          return slot ? publicJson(request, response, slot.files) : json(response, 404, { error: 'Slot not found.' });
+        }
+        if (request.method === 'POST' && url.pathname === `${v2base}/actions/wake`) {
+          if (request.headers['content-type']?.split(';')[0] !== 'application/json') return json(response, 415, { error: 'Wake requires JSON.' });
+          if (!next.allowRemoteWake) return json(response, 403, { status: 'disabled' });
+          if (!next.wakeNonce || request.headers['x-controller-wake'] !== next.wakeNonce) return json(response, 403, { error: 'Wake nonce rejected.' });
+          const origin = String(request.headers.origin || '');
+          if (origin && origin !== String(next.publicOrigin || origin)) return json(response, 403, { error: 'Origin rejected.' });
+          if (wakeBusy) return json(response, 409, { status: 'busy' });
+          if (Date.now() - lastWakeAt < 30_000) return json(response, 429, { status: 'busy', error: 'Wake is cooling down.' });
+          wakeBusy = true; lastWakeAt = Date.now();
+          try { return json(response, 200, await onWake({ roomId: next.roomId, ip })); }
+          finally { wakeBusy = false; }
+        }
+        const hostExport = url.pathname === `/api/controller/v2/host/room/${next.roomId}/export`;
+        if (request.method === 'GET' && hostExport) {
+          if (!isLoopback && !next.hostApiRemote) return json(response, 403, { error: 'The host API is loopback-only.' });
+          const supplied = String(request.headers.authorization || '').replace(/^Bearer\s+/i, '');
+          const expected = String(next.hostApiKey || '');
+          const valid = supplied.length === expected.length && supplied.length > 0 && timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
+          if (!valid) return json(response, 401, { error: 'Invalid host API key.' });
+          const sections = new Set(String(url.searchParams.get('sections') || 'snapshot,source,protocol,tracker,logic,diagnostics').split(',').map((value) => value.trim()));
+          if ([...sections].some((section) => !['snapshot', 'source', 'protocol', 'tracker', 'logic', 'diagnostics', 'spoilers'].includes(section))) return json(response, 400, { error: 'Unknown export section.' });
+          const includeSpoilers = url.searchParams.get('includeSpoilers') === 'true';
+          if (includeSpoilers && next.raceMode) return json(response, 403, { error: 'Spoiler export is unavailable for race-mode seeds.' });
+          if (includeSpoilers && !next.allowSpoilerApi) return json(response, 403, { error: 'Spoiler export is disabled in host settings.' });
+          const exported = {
+            ...(sections.has('snapshot') ? { snapshot } : {}),
+            ...(sections.has('source') ? { source: next.sourceMetadata || null } : {}),
+            ...(sections.has('protocol') ? { protocol: { observedAt: snapshotTime, endpoint: next.endpoint, connectedSlots: dashboard.players.filter((player) => /connected|playing|goal|finished/i.test(String(player.statusLabel || player.status || ''))).map((player) => player.slot), sourceRevision: snapshot.original.sourceRevision } } : {}),
+            ...(sections.has('tracker') ? { tracker: { dashboard, hints, activity: live.events, spheres: snapshot.enriched.spheres } } : {}),
+            ...(sections.has('logic') ? { logic: logicAnalyses } : {}),
+            ...(sections.has('spoilers') && includeSpoilers ? { spoilers: next.spoilerExport || { available: false, reason: 'absent', checks: [] } } : {}),
+            ...(sections.has('diagnostics') ? { diagnostics: { trackerRunning: Boolean(tracked), sphereAvailable: Boolean(sphereSnapshot?.available), spoilersIncluded: Boolean(includeSpoilers && next.allowSpoilerApi && next.raceMode === false) } } : {}),
+          };
+          if (Buffer.byteLength(JSON.stringify(exported)) > 32 * 1024 * 1024) return json(response, 413, { error: 'Requested export exceeds the 32 MB response limit. Select fewer sections.' });
+          return json(response, 200, exported);
+        }
+        const v2FileMatch = url.pathname.match(new RegExp(`^${v2base}/files/([A-Za-z0-9_-]{10,200})$`));
+        if (request.method === 'GET' && v2FileMatch) url.pathname = `${v1base}/files/${v2FileMatch[1]}`;
+        if (!url.pathname.startsWith(v1base)) return json(response, 404, { error: 'Not found.' });
         if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(ip)) onObserved(ip);
-        const base = `${API_PREFIX}${next.roomId}`;
+        const base = v1base;
         if (request.method === 'GET' && url.pathname === `${base}/status`) {
-          const live = liveState.snapshot();
-          const tracked = trackerSnapshot;
-          const trackedPlayers = new Map((tracked?.players || []).map((player) => [player.slot, player]));
-          const trackedNames = new Map((tracked?.players || []).map((player) => [String(player.name || '').trim().toLocaleLowerCase(), player]));
-          const hints = tracked?.hints?.map((hint) => ({
-            ...hint, timestamp: tracked.refreshedAt, type: hint.found ? 'Found' : 'Open',
-            message: `${hint.item} for ${hint.receivingName} at ${hint.location} (${hint.findingName})`,
-          })) ?? live.hints;
           return json(response, 200, {
           apiVersion: 1, roomId: next.roomId, label: next.label, generationId: next.generationId,
           provider: 'controller', createdAt: next.createdAt || null, startedAt: next.startedAt,
@@ -227,7 +380,13 @@ function createRoomPortal({ patchArchive, onObserved = () => {} }) {
     }
   }
 
-  return { start, stop, updatePresence, updateTracker, get running() { return Boolean(server?.listening); } };
+  function updateSpheres(snapshot) { sphereSnapshot = snapshot; }
+  function updateLogic(slot, analysis) {
+    if (!Number.isInteger(Number(slot))) return;
+    logicAnalyses = { ...logicAnalyses, [String(slot)]: analysis };
+  }
+
+  return { start, stop, updatePresence, updateTracker, updateSpheres, updateLogic, get running() { return Boolean(server?.listening); } };
 }
 
-module.exports = { API_PREFIX, createRoomPortal, localAddress, withTimeout };
+module.exports = { API_PREFIX, API_V2_PREFIX, SCHEMA_VERSION, createRoomPortal, localAddress, withTimeout };

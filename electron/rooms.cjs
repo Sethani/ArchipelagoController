@@ -41,6 +41,23 @@ function endpointFromStatus(raw) {
 
 async function refreshControllerRoom(net, rawUrl) {
   const room = parseControllerInvite(rawUrl);
+  const v2 = await net.fetch(`${room.origin}/api/controller/v2/room/${room.id}/snapshot`);
+  if (v2.ok) {
+    const snapshot = await v2.json();
+    if (Number(snapshot.apiVersion) !== 2) throw new Error(`Controller room API ${snapshot.apiVersion ?? 'unknown'} is not supported.`);
+    const endpoint = endpointFromStatus(snapshot.original);
+    const slots = uniqueSlots((Array.isArray(snapshot.original?.slots) ? snapshot.original.slots : []).map((slot) => ({
+      slot: Number(slot.slot), name: String(slot.name ?? `Slot ${slot.slot}`), game: String(slot.game ?? 'Unknown'),
+      downloadAvailable: Array.isArray(slot.files) && slot.files.length > 0,
+      remoteFiles: Array.isArray(slot.files) ? slot.files : [],
+    })));
+    return {
+      roomId: room.id, url: room.url, trackerId: undefined, lastPort: endpoint?.port, endpoint,
+      refreshedAt: String(snapshot.refreshedAt || new Date().toISOString()), stale: Boolean(snapshot.stale),
+      slots, snapshot, capabilities: snapshot.enriched?.capabilities, passwordRequired: Boolean(snapshot.original?.passwordRequired),
+    };
+  }
+  if (![404, 405].includes(v2.status)) throw new Error(`Controller room v2 returned HTTP ${v2.status}.`);
   const response = await net.fetch(`${room.origin}/api/controller/v1/room/${room.id}/status`);
   if (!response.ok) throw new Error(`Controller room returned HTTP ${response.status}.`);
   const raw = await response.json();
@@ -48,17 +65,52 @@ async function refreshControllerRoom(net, rawUrl) {
   const endpoint = endpointFromStatus(raw);
   return {
     roomId: room.id, url: room.url, trackerId: undefined, lastPort: endpoint?.port, endpoint,
-    refreshedAt: new Date().toISOString(), stale: false,
-    slots: (Array.isArray(raw.slots) ? raw.slots : []).map((slot) => ({
+    refreshedAt: new Date().toISOString(), stale: false, limitedHost: true, passwordRequired: Boolean(raw.passwordRequired),
+    capabilities: { apiVersion: 1, progress: Boolean(raw.progress), hints: Array.isArray(raw.hints), activity: Array.isArray(raw.activity), spheres: false, multipleFiles: true, browserTrackers: true, logicAnalysis: false, remoteWake: false },
+    slots: uniqueSlots((Array.isArray(raw.slots) ? raw.slots : []).map((slot) => ({
       slot: Number(slot.slot), name: String(slot.name ?? `Slot ${slot.slot}`), game: String(slot.game ?? 'Unknown'),
       downloadAvailable: Array.isArray(slot.files) && slot.files.length > 0,
-    })),
+      remoteFiles: Array.isArray(slot.files) ? slot.files.map((file) => ({ ...file, sourceId: file.id, revision: file.id })) : [],
+    }))),
   };
 }
 
 function safeName(value, fallback = 'Room') {
   const result = String(value ?? '').trim().replace(/[<>:"/\\|?*\x00-\x1f]+/g, '-').replace(/[. ]+$/g, '').slice(0, 80);
   return result || fallback;
+}
+
+function uniqueSlots(values) {
+  const result = [];
+  const slotIndexes = new Map();
+  const nameIndexes = new Map();
+  for (const raw of Array.isArray(values) ? values : []) {
+    const slot = Number(raw?.slot);
+    const name = String(raw?.name ?? '').trim();
+    if (!Number.isInteger(slot) || slot < 1 || !name) continue;
+    const nameKey = name.toLocaleLowerCase();
+    const existingIndex = slotIndexes.get(slot) ?? nameIndexes.get(nameKey);
+    if (existingIndex !== undefined) {
+      const existing = result[existingIndex];
+      const files = [...(existing.files ?? []), ...(raw.files ?? [])];
+      const remoteFiles = [...(existing.remoteFiles ?? []), ...(raw.remoteFiles ?? [])];
+      result[existingIndex] = {
+        ...existing,
+        mine: Boolean(existing.mine || raw.mine),
+        downloadAvailable: Boolean(existing.downloadAvailable || raw.downloadAvailable),
+        ...(files.length ? { files: [...new Map(files.map((file) => [file.id || file.path || file.name, file])).values()] } : {}),
+        ...(remoteFiles.length ? { remoteFiles: [...new Map(remoteFiles.map((file) => [file.id || file.sourceId || file.name, file])).values()] } : {}),
+      };
+      slotIndexes.set(slot, existingIndex);
+      nameIndexes.set(nameKey, existingIndex);
+      continue;
+    }
+    const index = result.length;
+    result.push({ ...raw, slot, name });
+    slotIndexes.set(slot, index);
+    nameIndexes.set(nameKey, index);
+  }
+  return result;
 }
 
 function inside(root, candidate) {
@@ -78,12 +130,12 @@ function normalizeRoomStatus(raw, room) {
   if (!raw || typeof raw !== 'object') throw new Error('The room service returned invalid data.');
   const players = Array.isArray(raw.players) ? raw.players : [];
   const downloads = new Map((Array.isArray(raw.downloads) ? raw.downloads : []).map((item) => [Number(item?.slot), String(item?.download ?? '')]));
-  const slots = players.map((entry, index) => {
+  const slots = uniqueSlots(players.map((entry, index) => {
     const tuple = Array.isArray(entry) ? entry : [];
     const hasNumber = Number.isInteger(Number(tuple[0])) && tuple.length >= 3;
     const slot = hasNumber ? Number(tuple[0]) : index + 1;
     return { slot, name: String(tuple[hasNumber ? 1 : 0] ?? `Slot ${slot}`), game: String(tuple[hasNumber ? 2 : 1] ?? 'Unknown'), downloadAvailable: downloads.has(slot) };
-  });
+  }));
   const port = Number(raw.last_port);
   return {
     roomId: room.id,
@@ -269,28 +321,55 @@ async function downloadSlot(net, payload) {
   return listFiles(downloadFolder, 'downloaded');
 }
 
-async function downloadControllerSlot(net, payload) {
+async function readBoundedDownload(response, fileName, onProgress, signal) {
+  const declared = Number(response.headers.get('content-length'));
+  if (declared > MAX_DOWNLOAD_BYTES) throw new Error(`${fileName} is larger than the 512 MB safety limit.`);
+  if (!response.body?.getReader) return new Uint8Array(await response.arrayBuffer());
+  const reader = response.body.getReader();
+  const chunks = []; let received = 0;
+  while (true) {
+    if (signal?.aborted) { await reader.cancel(); throw new Error('Download cancelled.'); }
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > MAX_DOWNLOAD_BYTES) { await reader.cancel(); throw new Error(`${fileName} is larger than the 512 MB safety limit.`); }
+    chunks.push(Buffer.from(value));
+    onProgress?.({ received, total: Number.isFinite(declared) && declared > 0 ? declared : undefined, fileName });
+  }
+  return new Uint8Array(Buffer.concat(chunks));
+}
+
+async function downloadControllerSlot(net, payload, options = {}) {
   const room = parseControllerInvite(payload.roomUrl);
-  const filesResponse = await net.fetch(`${room.origin}/api/controller/v1/room/${room.id}/slots/${Number(payload.slot)}/files`);
+  let apiVersion = Number(payload?.provider?.apiVersion || 2);
+  let filesResponse = await net.fetch(`${room.origin}/api/controller/v2/room/${room.id}/slots/${Number(payload.slot)}/files`);
+  if (!filesResponse.ok && [404, 405].includes(filesResponse.status)) {
+    apiVersion = 1;
+    filesResponse = await net.fetch(`${room.origin}/api/controller/v1/room/${room.id}/slots/${Number(payload.slot)}/files`);
+  }
   if (!filesResponse.ok) throw new Error(`Controller room file list returned HTTP ${filesResponse.status}.`);
   const files = await filesResponse.json();
   if (!Array.isArray(files) || !files[0]?.id) throw new Error('This slot has no shared file.');
-  const response = await net.fetch(`${room.origin}/api/controller/v1/room/${room.id}/files/${encodeURIComponent(files[0].id)}`);
-  if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}.`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_DOWNLOAD_BYTES) throw new Error('The slot file is larger than the 512 MB safety limit.');
   const folder = inside(payload.roomsRoot, payload.folderPath);
   const downloadFolder = inside(folder, path.join(folder, 'downloads', safeName(payload.slotName, `slot-${payload.slot}`)));
   await fs.mkdir(downloadFolder, { recursive: true });
-  const target = inside(downloadFolder, path.join(downloadFolder, safeName(files[0].name, `slot-${payload.slot}.patch`)));
-  const temporary = `${target}.${randomUUID()}.part`;
-  await fs.writeFile(temporary, bytes);
-  await fs.rename(temporary, target).catch(async (error) => {
-    if (error.code !== 'EEXIST') throw error;
-    await fs.rm(target, { force: true });
-    await fs.rename(temporary, target);
-  });
-  return listFiles(downloadFolder, 'downloaded');
+  const selectedIds = new Set(Array.isArray(payload.fileIds) && payload.fileIds.length ? payload.fileIds.map(String) : files.map((file) => String(file.id)));
+  const downloaded = [];
+  for (const file of files.filter((item) => selectedIds.has(String(item.id)))) {
+    const response = await net.fetch(`${room.origin}/api/controller/v${apiVersion}/room/${room.id}/files/${encodeURIComponent(file.id)}`, { signal: options.signal });
+    if (!response.ok) throw new Error(`Download of ${file.name} failed with HTTP ${response.status}.`);
+    const bytes = await readBoundedDownload(response, file.name, (progress) => options.onProgress?.({ ...progress, fileId: file.id }), options.signal);
+    if (bytes.byteLength > MAX_DOWNLOAD_BYTES) throw new Error(`${file.name} is larger than the 512 MB safety limit.`);
+    const target = inside(downloadFolder, path.join(downloadFolder, safeName(file.name, `slot-${payload.slot}.patch`)));
+    const temporary = `${target}.${randomUUID()}.part`;
+    try {
+      await fs.writeFile(temporary, bytes, { flag: 'wx' });
+      await fs.rm(target, { force: true });
+      await fs.rename(temporary, target);
+    } finally { await fs.rm(temporary, { force: true }).catch(() => {}); }
+    downloaded.push(await fileRecord(target, 'downloaded', String(file.id)));
+  }
+  return downloaded;
 }
 
 async function importFile(sourcePath, payload) {
@@ -406,7 +485,7 @@ function matchingSlot(slots, name, manifest) {
 
 async function adoptLocalRun(payload) {
   const folder = await ensureRoom(payload.roomsRoot, payload.label, payload.roomId);
-  const slots = (Array.isArray(payload.slots) ? payload.slots : []).map((slot, index) => ({ slot: Number(slot.slot) || index + 1, name: String(slot.name), game: String(slot.game), mine: true, downloadAvailable: false, files: [] }));
+  const slots = uniqueSlots((Array.isArray(payload.slots) ? payload.slots : []).map((slot, index) => ({ slot: Number(slot.slot) || index + 1, name: String(slot.name), game: String(slot.game), mine: true, downloadAvailable: false, files: [] })));
   const sourceRoot = path.resolve(String(payload.sessionPath ?? ''));
   const candidates = [];
   async function walk(root, depth = 0) {
@@ -485,7 +564,7 @@ async function sharedSlotInventory(payload) {
   const folder = inside(payload.roomsRoot, payload.folderPath);
   const shared = new Set((payload.sharedSlots ?? []).map(Number));
   const result = [];
-  for (const slot of payload.slots ?? []) {
+  for (const slot of uniqueSlots(payload.slots ?? [])) {
     let files = [];
     if (shared.has(Number(slot.slot))) {
       const slotFolder = inside(folder, path.join(folder, 'downloads', safeName(slot.name, `slot-${slot.slot}`)));
@@ -498,5 +577,5 @@ async function sharedSlotInventory(payload) {
 
 module.exports = {
   MAX_DOWNLOAD_BYTES, adoptLocalRun, archiveSlotSummary, connectionUri, downloadControllerSlot, downloadSlot, ensureRoom, importFile, inside, listFiles,
-  normalizeRoomStatus, normalizeTrackerDashboard, opaqueFileId, parseControllerInvite, parseRoomUrl, patchArchive, prepareFile, refreshControllerRoom, refreshRoom, roomFolder, safeName, sharedSlotInventory, sphereTrackerUrl, trackerUrl,
+  normalizeRoomStatus, normalizeTrackerDashboard, opaqueFileId, parseControllerInvite, parseRoomUrl, patchArchive, prepareFile, refreshControllerRoom, refreshRoom, roomFolder, safeName, sharedSlotInventory, sphereTrackerUrl, trackerUrl, uniqueSlots,
 };

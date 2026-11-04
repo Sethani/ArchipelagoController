@@ -72,11 +72,18 @@ function createTrackerSidecar({ createSocket, onUpdate = () => {}, setTimer = se
       statusLabel: STATUS_LABELS.get(session.status) || `Status ${session.status}`,
       lastActivity: session.lastActivity, lastConnection: session.lastConnection,
       hintCount: hints.length, unresolvedHintCount: hints.filter((hint) => !hint.found).length,
+      checkedLocationIds: [...session.checked].sort((a, b) => a - b),
+      missingLocationIds: [...session.locations].filter((id) => !session.checked.has(id)).sort((a, b) => a - b),
     };
   }
 
   function snapshot() {
-    const players = [...sessions.values()].sort((a, b) => a.slot - b.slot).map(player);
+    const uniqueSessions = new Map();
+    for (const session of sessions.values()) {
+      const existing = uniqueSessions.get(session.slot);
+      if (!existing || session.checked.size > existing.checked.size || session.itemsReceived > existing.itemsReceived) uniqueSessions.set(session.slot, session);
+    }
+    const players = [...uniqueSessions.values()].sort((a, b) => a.slot - b.slot).map(player);
     const hints = new Map();
     for (const session of sessions.values()) for (const raw of session.hints.values()) {
       const hint = resolveHint(raw);
@@ -88,6 +95,9 @@ function createTrackerSidecar({ createSocket, onUpdate = () => {}, setTimer = se
       checksTotal: players.reduce((sum, value) => sum + value.checksTotal, 0),
       completedPlayers: players.filter((value) => value.status === 30).length,
       unresolvedHints: [...hints.values()].filter((hint) => !hint.found).length,
+      dataPackages: Object.fromEntries([...packages.entries()].map(([game, data]) => [game, {
+        items: Object.fromEntries(data.items), locations: Object.fromEntries(data.locations),
+      }])),
     };
   }
 
@@ -195,12 +205,15 @@ function createTrackerSidecar({ createSocket, onUpdate = () => {}, setTimer = se
     if (!room.roomId || !Number.isInteger(room.port) || room.port < 1 || room.port > 65535) throw new Error('Invalid tracker sidecar room configuration.');
     stopped = false;
     const token = generation;
+    const names = new Set();
     for (const source of config.slots || []) {
       const slot = Number(source.slot);
       const name = String(source.name || '').trim();
       const game = String(source.game || '').trim();
-      if (!Number.isInteger(slot) || slot < 1 || !name || !game || sessions.has(slot)) continue;
+      const nameKey = name.toLocaleLowerCase();
+      if (!Number.isInteger(slot) || slot < 1 || !name || !game || sessions.has(slot) || names.has(nameKey)) continue;
       sessions.set(slot, { slot, name, game, checked: new Set(), locations: new Set(), hints: new Map(), itemsReceived: 0, status: 0, retry: 0, retryTimer: null, socket: null, manualClose: false });
+      names.add(nameKey);
     }
     for (const session of sessions.values()) connect(session, token);
     emit();

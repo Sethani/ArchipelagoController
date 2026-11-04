@@ -6,12 +6,24 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { unzipSync, zipSync } from 'fflate';
 
 const require = createRequire(import.meta.url);
-const { adoptLocalRun, archiveSlotSummary, connectionUri, ensureRoom, inside, normalizeRoomStatus, normalizeTrackerDashboard, parseControllerInvite, parseRoomUrl, patchArchive, prepareFile, sharedSlotInventory, sphereTrackerUrl, trackerUrl } = require('./rooms.cjs');
+const { adoptLocalRun, archiveSlotSummary, connectionUri, ensureRoom, inside, normalizeRoomStatus, normalizeTrackerDashboard, parseControllerInvite, parseRoomUrl, patchArchive, prepareFile, refreshControllerRoom, sharedSlotInventory, sphereTrackerUrl, trackerUrl, uniqueSlots } = require('./rooms.cjs');
 const temporary = [];
 
 afterEach(async () => Promise.all(temporary.splice(0).map((folder) => rm(folder, { recursive: true, force: true }))));
 
 describe('room links and status', () => {
+  it('deduplicates slots by AP slot id or normalized slot name', () => {
+    expect(uniqueSlots([
+      { slot: 1, name: 'Player_MC', game: 'Minecraft', files: [{ id: 'a' }] },
+      { slot: 1, name: 'Player_MC', game: 'Minecraft', files: [{ id: 'b' }] },
+      { slot: 2, name: 'player_mc', game: 'Minecraft', files: [{ id: 'c' }] },
+      { slot: 3, name: 'Player_TW', game: 'The Witness', files: [] },
+    ])).toEqual([
+      expect.objectContaining({ slot: 1, name: 'Player_MC', files: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] }),
+      expect.objectContaining({ slot: 3, name: 'Player_TW' }),
+    ]);
+  });
+
   it('accepts only canonical official room links', () => {
     expect(parseRoomUrl('https://archipelago.gg/room/wDTli-QPTyG76HjQiab0aw')).toMatchObject({ id: 'wDTli-QPTyG76HjQiab0aw' });
     expect(() => parseRoomUrl('http://archipelago.gg/room/wDTli-QPTyG76HjQiab0aw')).toThrow(/Only https/);
@@ -66,6 +78,26 @@ describe('room links and status', () => {
 
   it('builds connection URIs for non-official room providers', () => {
     expect(connectionUri('Player', 'pw', 'games.example.test', 38281, 'Test Game')).toBe('archipelago://Player:pw@games.example.test:38281?game=Test%20Game');
+  });
+
+  it('negotiates Controller API v2 and preserves the rich snapshot', async () => {
+    const snapshot = {
+      apiVersion: 2, refreshedAt: '2026-11-03T18:00:00.000Z', stale: false,
+      original: { endpoint: { host: 'rooms.example.test', port: 443, secure: true }, slots: [{ slot: 1, name: 'Player', game: 'Game', files: [{ id: 'file_123456', name: 'player.apgame', size: 12, kind: 'downloaded', sourceId: 'file_123456', revision: 'r1' }] }] },
+      enriched: { capabilities: { apiVersion: 2, progress: true, hints: true, activity: true, spheres: false, multipleFiles: true, browserTrackers: true, logicAnalysis: true, remoteWake: false }, dashboard: { players: [] } },
+    };
+    const net = { fetch: async (url) => new Response(JSON.stringify(snapshot), { status: url.includes('/v2/') ? 200 : 500, headers: { 'content-type': 'application/json' } }) };
+    const result = await refreshControllerRoom(net, 'https://rooms.example.test/room/local-123456');
+    expect(result).toMatchObject({ lastPort: 443, capabilities: { apiVersion: 2 }, slots: [{ downloadAvailable: true }] });
+    expect(result.snapshot).toEqual(snapshot);
+    expect(result.slots[0].remoteFiles).toHaveLength(1);
+  });
+
+  it('falls back visibly to a limited v1 Controller host', async () => {
+    const net = { fetch: async (url) => url.includes('/v2/')
+      ? new Response('{}', { status: 404 })
+      : new Response(JSON.stringify({ apiVersion: 1, endpoint: { host: 'old.example', port: 38281 }, slots: [] }), { status: 200, headers: { 'content-type': 'application/json' } }) };
+    expect(await refreshControllerRoom(net, 'https://rooms.example.test/room/local-123456')).toMatchObject({ limitedHost: true, capabilities: { apiVersion: 1 } });
   });
 });
 

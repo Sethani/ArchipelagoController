@@ -32,18 +32,26 @@ contextBridge.exposeInMainWorld('archipelago', {
   openPatch: (installRoot) => ipcRenderer.invoke('tools:open-patch', installRoot),
   inspectRoom: (payload) => ipcRenderer.invoke('rooms:inspect', payload),
   takeRoomInvite: () => ipcRenderer.invoke('rooms:take-invite'),
+  takeRoomApWorldInstall: () => ipcRenderer.invoke('rooms:take-install-apworld'),
+  wakeRoom: (payload) => ipcRenderer.invoke('rooms:wake', payload),
   ensureRoom: (payload) => ipcRenderer.invoke('rooms:ensure', payload),
   adoptLocalRoom: (payload) => ipcRenderer.invoke('rooms:adopt-local', payload),
   listRoomFiles: (payload) => ipcRenderer.invoke('rooms:list-files', payload),
   downloadRoomSlot: (payload) => ipcRenderer.invoke('rooms:download-slot', payload),
+  cancelRoomDownload: (jobId) => ipcRenderer.invoke('rooms:cancel-download', jobId),
   importRoomFile: (payload) => ipcRenderer.invoke('rooms:import-file', payload),
   launchRoomFile: (payload) => ipcRenderer.invoke('rooms:launch-file', payload),
   launchRoomClient: (payload) => ipcRenderer.invoke('rooms:launch-client', payload),
   openRoomTracker: (payload) => ipcRenderer.invoke('rooms:open-tracker', payload),
   openRoomSphereTracker: (payload) => ipcRenderer.invoke('rooms:open-sphere-tracker', payload),
   getRoomTrackerDashboard: (payload) => ipcRenderer.invoke('rooms:tracker-dashboard', payload),
+  getRoomSpheres: (payload) => ipcRenderer.invoke('rooms:spheres', payload),
   launchRoomUniversalTracker: (payload) => ipcRenderer.invoke('rooms:launch-universal-tracker', payload),
   analyzeRoomUniversalTracker: (payload) => ipcRenderer.invoke('rooms:analyze-universal-tracker', payload),
+  cancelRoomUniversalTracker: (payload) => ipcRenderer.invoke('rooms:cancel-universal-tracker', payload),
+  getRoomLogicEnvironment: (payload) => ipcRenderer.invoke('rooms:logic-environment', payload),
+  installRequiredRoomApWorld: (payload) => ipcRenderer.invoke('rooms:install-required-apworld', payload),
+  configureRoomHostApiKey: (payload) => ipcRenderer.invoke('rooms:host-api-key', payload),
   inventoryPopTracker: (executablePath) => ipcRenderer.invoke('poptracker:inventory', executablePath),
   inventoryMinecraftLauncher: () => ipcRenderer.invoke('minecraft:inventory'),
   launchRoomPopTracker: (payload) => ipcRenderer.invoke('rooms:launch-poptracker', payload),
@@ -93,10 +101,25 @@ contextBridge.exposeInMainWorld('archipelago', {
     ipcRenderer.on('rooms:share-status', handler);
     return () => ipcRenderer.removeListener('rooms:share-status', handler);
   },
+  onRoomDownloadProgress: (callback) => {
+    const handler = (_event, value) => callback(value);
+    ipcRenderer.on('rooms:download-progress', handler);
+    return () => ipcRenderer.removeListener('rooms:download-progress', handler);
+  },
+  onRoomWakeRequest: (callback) => {
+    const handler = (_event, value) => callback(value);
+    ipcRenderer.on('rooms:wake-request', handler);
+    return () => ipcRenderer.removeListener('rooms:wake-request', handler);
+  },
   onRoomInvite: (callback) => {
     const handler = (_event, value) => callback(value);
     ipcRenderer.on('rooms:invite', handler);
     return () => ipcRenderer.removeListener('rooms:invite', handler);
+  },
+  onRoomApWorldInstall: (callback) => {
+    const handler = (_event, value) => callback(value);
+    ipcRenderer.on('rooms:install-apworld', handler);
+    return () => ipcRenderer.removeListener('rooms:install-apworld', handler);
   },
   onYamlValidationProgress: (callback) => {
     const handler = (_event, value) => callback(value);

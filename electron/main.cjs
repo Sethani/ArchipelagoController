@@ -1,12 +1,12 @@
 const { app, BrowserWindow, clipboard, dialog, ipcMain, net, safeStorage, shell } = require('electron');
 const { spawn } = require('node:child_process');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomBytes, randomUUID } = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const { extractZip } = require('./archive.cjs');
 const { createApWorldService } = require('./apworlds.cjs');
-const { createYamlValidator } = require('./yaml-validation.cjs');
+const { createYamlValidator, yamlFingerprint: contentFingerprint } = require('./yaml-validation.cjs');
 const { inventoryLauncherComponents, resolveLauncherClient } = require('./launcher-components.cjs');
 const { createApUpdateService } = require('./ap-update.cjs');
 const { readHostConfig, writeHostConfig } = require('./host-config.cjs');
@@ -19,6 +19,7 @@ const { actionFromShortcut, launchProfile } = require('./game-launch.cjs');
 const { inventoryMinecraftLauncher } = require('./minecraft-launcher.cjs');
 const { parseUniversalTrackerOutput } = require('./universal-tracker.cjs');
 const { createTrackerSidecar } = require('./tracker-sidecar.cjs');
+const { archiveMultidata, checkedSphereSnapshot, completeSphereSnapshot } = require('./multidata-spheres.cjs');
 const YAML = require('yaml');
 
 const isDev = process.argv.includes('--dev');
@@ -32,19 +33,52 @@ let mainWindow = null;
 let activeGeneratorJobs = 0;
 let validationBusy = false;
 let activeShare = null;
+let activeSphereData = null;
+let activeSphereSnapshot = null;
 let gatewayStatus = { gateway: 'disabled', certificate: 'unused', firewall: 'unused' };
 let pendingRoomInvite = process.argv.find((value) => /^archipelago-controller:\/\/join/i.test(value));
+function roomInstallWorldId(raw) {
+  try {
+    if (!/^archipelago-controller:\/\/install-apworld/i.test(String(raw || ''))) return undefined;
+    const worldId = new URL(raw).searchParams.get('worldId');
+    return ['tracker', 'slotlock'].includes(worldId) ? worldId : undefined;
+  } catch { return undefined; }
+}
+let pendingRoomInstall = roomInstallWorldId(process.argv.find((value) => /^archipelago-controller:\/\/install-apworld/i.test(value)));
 const trackerPackageCache = new Map();
+const sphereArtifactCache = new Map();
+const activeLogicAnalyses = new Map();
+const activeRoomDownloads = new Map();
 const roomPortal = createRoomPortal({
   patchArchive: rooms.patchArchive,
   onObserved: () => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:share-status', { reachability: 'observed' });
   },
+  onWake: async ({ roomId }) => {
+    if (!activeShare || activeShare.roomId !== roomId) return { status: 'host unavailable' };
+    if (!activeShare.portalConfig.allowRemoteWake) return { status: 'disabled' };
+    if (activeHost && activeHost.exitCode === null) return { status: activeHostMeta?.roomId === roomId ? 'online' : 'busy' };
+    if (!mainWindow || mainWindow.isDestroyed()) return { status: 'host unavailable' };
+    mainWindow.webContents.send('rooms:wake-request', { roomId });
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      if (activeHost && activeHost.exitCode === null) return { status: activeHostMeta?.roomId === roomId ? 'online' : 'busy' };
+    }
+    return { status: 'failed', error: 'Controller did not confirm that the game server started.' };
+  },
 });
 const trackerSidecar = createTrackerSidecar({
   createSocket: (url) => new net.WebSocket(url),
   onUpdate: (snapshot) => {
-    if (activeShare?.roomId === snapshot.roomId) roomPortal.updateTracker(snapshot);
+    if (activeShare?.roomId === snapshot.roomId) {
+      roomPortal.updateTracker(snapshot);
+      void fs.writeFile(path.join(activeShare.folderPath, 'tracker-snapshot.json'), JSON.stringify(snapshot), 'utf8').catch(() => {});
+      if (activeSphereData) {
+        activeSphereSnapshot = { ...checkedSphereSnapshot(activeSphereData.value, snapshot), artifactHash: activeSphereData.hash, refreshedAt: new Date().toISOString() };
+        roomPortal.updateSpheres(activeSphereSnapshot);
+      }
+    }
   },
 });
 const gatewayFirewall = createGatewayFirewall({
@@ -88,6 +122,14 @@ app.on('second-instance', (_event, argv) => {
     pendingRoomInvite = invite;
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:invite', invite);
   }
+  const installLink = argv.find((value) => /^archipelago-controller:\/\/install-apworld/i.test(value));
+  if (installLink) {
+    const worldId = roomInstallWorldId(installLink);
+    if (worldId) {
+      pendingRoomInstall = worldId;
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:install-apworld', worldId);
+    }
+  }
   if (mainWindow) { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.focus(); }
 });
 app.on('open-url', (event, url) => {
@@ -95,6 +137,13 @@ app.on('open-url', (event, url) => {
   if (/^archipelago-controller:\/\/join/i.test(url)) {
     pendingRoomInvite = url;
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:invite', url);
+  }
+  if (/^archipelago-controller:\/\/install-apworld/i.test(url)) {
+    const worldId = roomInstallWorldId(url);
+    if (worldId) {
+      pendingRoomInstall = worldId;
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:install-apworld', worldId);
+    }
   }
 });
 
@@ -429,7 +478,7 @@ ipcMain.handle('rooms:inspect', ipcResult(async (payload) => {
     try { invitation = rooms.parseControllerInvite(payload?.url); }
     catch { throw officialError; }
     const status = await rooms.refreshControllerRoom(net, invitation.url);
-    return { ...status, provider: { type: 'controller', roomUrl: invitation.url, apiVersion: 1 } };
+    return { ...status, provider: { type: 'controller', roomUrl: invitation.url, apiVersion: status.capabilities?.apiVersion ?? 1, capabilities: status.capabilities } };
   }
 }));
 ipcMain.handle('rooms:take-invite', () => {
@@ -437,6 +486,23 @@ ipcMain.handle('rooms:take-invite', () => {
   pendingRoomInvite = undefined;
   return invite ?? null;
 });
+ipcMain.handle('rooms:take-install-apworld', () => {
+  const worldId = pendingRoomInstall;
+  pendingRoomInstall = undefined;
+  return worldId ?? null;
+});
+ipcMain.handle('rooms:wake', ipcResult(async (payload) => {
+  const room = rooms.parseControllerInvite(payload?.provider?.roomUrl || payload?.roomUrl);
+  const statusResponse = await net.fetch(`${room.origin}/api/controller/v2/room/${room.id}/status`);
+  if (!statusResponse.ok) throw new Error(`Wake status returned HTTP ${statusResponse.status}.`);
+  const status = await statusResponse.json();
+  const response = await net.fetch(`${room.origin}/api/controller/v2/room/${room.id}/actions/wake`, {
+    method: 'POST', headers: { 'content-type': 'application/json', origin: room.origin, 'x-controller-wake': String(status.wakeNonce || '') }, body: '{}',
+  });
+  const result = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+  if (!response.ok && result.status !== 'disabled') throw new Error(result.error || result.status || `Wake failed with HTTP ${response.status}.`);
+  return result;
+}));
 ipcMain.handle('rooms:ensure', ipcResult(async (payload) => ({ folderPath: await rooms.ensureRoom(payload?.roomsRoot, payload?.label, payload?.roomId) })));
 ipcMain.handle('rooms:adopt-local', ipcResult(async (payload) => rooms.adoptLocalRun(payload)));
 ipcMain.handle('rooms:list-files', ipcResult(async (payload) => {
@@ -447,9 +513,25 @@ ipcMain.handle('rooms:list-files', ipcResult(async (payload) => {
   return { downloads, play };
 }));
 ipcMain.handle('rooms:download-slot', ipcResult(async (payload) => {
-  if (payload?.provider?.type === 'controller') return rooms.downloadControllerSlot(net, payload);
+  if (payload?.provider?.type === 'controller') {
+    const jobId = String(payload?.jobId || randomUUID());
+    if (!/^[A-Za-z0-9:_-]{6,160}$/.test(jobId)) throw new Error('Invalid room download job.');
+    const controller = new AbortController();
+    activeRoomDownloads.set(jobId, controller);
+    try {
+      return await rooms.downloadControllerSlot(net, payload, { signal: controller.signal, onProgress: (progress) => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('rooms:download-progress', { jobId, ...progress });
+      } });
+    } finally { activeRoomDownloads.delete(jobId); }
+  }
   if (payload?.provider?.type === 'local') throw new Error('Local room files are already available in this workspace.');
   return rooms.downloadSlot(net, payload);
+}));
+ipcMain.handle('rooms:cancel-download', ipcResult(async (jobId) => {
+  const controller = activeRoomDownloads.get(String(jobId));
+  if (!controller) return { cancelled: false };
+  controller.abort();
+  return { cancelled: true };
 }));
 ipcMain.handle('rooms:import-file', ipcResult(async (payload) => {
   const result = await dialog.showOpenDialog({ title: `Add a file for ${String(payload?.slotName ?? 'room slot')}`, properties: ['openFile'] });
@@ -492,6 +574,21 @@ ipcMain.handle('rooms:start-sharing', ipcResult(async (payload) => {
   if (gateway.mode === 'external' && !String(gateway.publicBaseUrl ?? '').startsWith('https://')) throw new Error('Configure an HTTPS public portal URL in Settings.');
   const slots = await rooms.sharedSlotInventory(payload);
   if (!slots.length) throw new Error('This room has no player slots to share.');
+  const roomComponents = await inventoryLauncherComponents(payload?.installRoot).catch(() => []);
+  const hostApiKey = payload?.hostApi?.secretRef ? await getSecret(payload.hostApi.secretRef) : '';
+  activeSphereData = null;
+  activeSphereSnapshot = null;
+  let sphereUnavailable = { available: false, reason: 'absent', checks: [], refreshedAt: new Date().toISOString() };
+  if (payload?.hosted?.artifactPath) {
+    try {
+      const bytes = await fs.readFile(path.resolve(payload.hosted.artifactPath));
+      const cacheKey = createHash('sha256').update(bytes).digest('hex');
+      activeSphereData = sphereArtifactCache.get(cacheKey) ?? archiveMultidata(bytes);
+      sphereArtifactCache.set(cacheKey, activeSphereData);
+      while (sphereArtifactCache.size > 8) sphereArtifactCache.delete(sphereArtifactCache.keys().next().value);
+    }
+    catch (error) { sphereUnavailable = { available: false, reason: /version|protocol|opcode|global/i.test(error.message) ? 'incompatible' : 'malformed', error: error.message, checks: [], refreshedAt: new Date().toISOString() }; }
+  }
   const portalConfig = {
     roomId, label: String(payload.label || 'Archipelago Room'), generationId: String(payload.hosted.historyRunId || ''),
     createdAt: String(payload.createdAt || ''), passwordRequired: Boolean(payload.passwordRequired),
@@ -499,6 +596,31 @@ ipcMain.handle('rooms:start-sharing', ipcResult(async (payload) => {
     bindHost: gateway.mode === 'managed' ? '127.0.0.1' : '0.0.0.0',
     mappingPorts: gateway.mode === 'managed' ? [80, 443, 38281, gamePort] : gateway.mode === 'external' ? [gamePort] : [portalPort, gamePort],
     serverRunning: Boolean(activeHost && activeHost.exitCode === null && activeHostMeta?.roomId === roomId),
+    allowRemoteWake: Boolean(payload.hosted.allowRemoteWake),
+    wakeNonce: randomBytes(16).toString('base64url'),
+    tools: {
+      trackerInstalled: roomComponents.some((component) => component.displayName === 'Universal Tracker'),
+      slotlockInstalled: roomComponents.some((component) => /slotlock/i.test(component.displayName)),
+      hasSlotLock: slots.some((slot) => /slotlock/i.test(slot.game)),
+    },
+    hostApiKey,
+    hostApiRemote: Boolean(payload?.hostApi?.remoteEnabled),
+    allowSpoilerApi: Boolean(payload?.hostApi?.allowSpoilers),
+    raceMode: Boolean(activeSphereData?.value?.race_mode),
+    sourceMetadata: activeSphereData ? {
+      artifactSha256: activeSphereData.hash,
+      seedName: String(activeSphereData.value?.seed_name || ''),
+      multidataVersion: Number(activeSphereData.value?.version || 3),
+      slotCount: Object.keys(activeSphereData.value?.slot_info || {}).length,
+      games: [...new Set(Object.values(activeSphereData.value?.slot_info || {}).map((entry) => String(entry?.args?.[1] || 'Unknown')))],
+      staticSphereCount: Array.isArray(activeSphereData.value?.spheres) ? activeSphereData.value.spheres.length : 0,
+      raceMode: Boolean(activeSphereData.value?.race_mode),
+    } : undefined,
+    spoilerExport: activeSphereData && payload?.hostApi?.allowSpoilers && !activeSphereData.value?.race_mode
+      ? completeSphereSnapshot(activeSphereData.value) : undefined,
+    publicOrigin: gateway.mode === 'managed' ? `https://${gateway.hostname}`
+      : gateway.mode === 'external' ? new URL(gateway.publicBaseUrl).origin
+        : `http://${String(payload.hosted.advertisedHost || '')}:${portalPort}`,
     endpoint: { host: String(payload.hosted.advertisedHost || ''), port: gateway.mode === 'managed' ? 443 : gamePort, secure: gateway.mode === 'managed' },
   };
   await publishShareStatus({ roomId, state: 'starting', serverRunning: portalConfig.serverRunning, portalRunning: false, mapping: portalConfig.automaticPortMapping ? 'starting' : 'disabled', reachability: 'unknown' });
@@ -544,6 +666,10 @@ ipcMain.handle('rooms:start-sharing', ipcResult(async (payload) => {
   try {
     gatewayStatus = gateway.mode === 'managed' ? { ...gatewayStatus, gateway: 'starting', certificate: 'obtaining' } : { gateway: gateway.mode === 'external' ? 'online' : 'disabled', certificate: gateway.mode === 'external' ? 'ready' : 'unused', firewall: 'unused' };
     result = await roomPortal.start(portalConfig, startManagedGateway);
+    activeSphereSnapshot = activeSphereData && trackerSidecar.roomId === roomId
+      ? { ...checkedSphereSnapshot(activeSphereData.value, trackerSidecar.snapshot()), artifactHash: activeSphereData.hash, refreshedAt: new Date().toISOString() }
+      : sphereUnavailable;
+    roomPortal.updateSpheres(activeSphereSnapshot);
     if (trackerSidecar.roomId === roomId) roomPortal.updateTracker(trackerSidecar.snapshot());
     if (gateway.mode === 'managed' && !managedGatewayStarted) throw new Error('Managed HTTPS did not start.');
     baseUrl = shareBaseUrl(payload.hosted, gateway, result.externalIp);
@@ -554,7 +680,16 @@ ipcMain.handle('rooms:start-sharing', ipcResult(async (payload) => {
     await roomPortal.stop();
     throw error;
   }
-  activeShare = { roomId, baseUrl, portalConfig, result };
+  const shareFolder = rooms.inside(payload.roomsRoot, payload.folderPath);
+  activeShare = { roomId, baseUrl, portalConfig, result, folderPath: shareFolder };
+  try {
+    const cachedTracker = JSON.parse(await fs.readFile(path.join(shareFolder, 'tracker-snapshot.json'), 'utf8'));
+    if (!trackerSidecar.running || trackerSidecar.roomId !== roomId) roomPortal.updateTracker({ ...cachedTracker, stale: true });
+  } catch { /* Tracker persistence is optional until the first live update. */ }
+  try {
+    const cachedLogic = JSON.parse(await fs.readFile(path.join(shareFolder, 'logic-analyses.json'), 'utf8'));
+    for (const [slot, analysis] of Object.entries(cachedLogic)) roomPortal.updateLogic(Number(slot), { ...analysis, stale: true });
+  } catch { /* Logic persistence is optional. */ }
   const status = { roomId, state: 'sharing', serverRunning: portalConfig.serverRunning, portalRunning: true, mapping: result.mapping, reachability: 'unknown', publicUrl: `${baseUrl}/room/${roomId}`, secureGameEndpoint: gateway.mode === 'managed' ? `${portalConfig.endpoint.host}:443` : undefined, compatibilityGameEndpoint: gateway.mode === 'managed' ? `${portalConfig.endpoint.host}:38281` : undefined, error: result.mappingError, ...gatewayStatus };
   await publishShareStatus(status);
   return { ...status, advertisedHost: portalConfig.endpoint.host, mappingMethod: result.mappingMethod };
@@ -565,6 +700,8 @@ ipcMain.handle('rooms:stop-sharing', ipcResult(async (payload) => {
   const roomId = activeShare?.roomId ?? payload?.roomId;
   await httpsGateway.stop();
   await roomPortal.stop();
+  activeSphereData = null;
+  activeSphereSnapshot = null;
   gatewayStatus = { gateway: 'disabled', certificate: 'unused', firewall: 'unused' };
   activeShare = null;
   const status = { roomId, state: 'offline', serverRunning: Boolean(activeHost && activeHost.exitCode === null && activeHostMeta?.roomId === roomId), portalRunning: false, mapping: 'disabled', reachability: 'unknown', ...gatewayStatus };
@@ -637,13 +774,36 @@ ipcMain.handle('rooms:launch-client', ipcResult(async (payload) => {
 }));
 
 ipcMain.handle('rooms:open-tracker', ipcResult(async (payload) => {
-  if (payload?.provider?.type !== 'official' && payload?.provider) throw new Error('This room does not currently provide a WebHost tracker.');
+  if (payload?.provider?.type === 'controller') {
+    const invitation = rooms.parseControllerInvite(payload?.provider?.roomUrl || payload?.roomUrl);
+    const url = `${invitation.url}${payload?.slot ? `#slot-${Number(payload.slot)}` : '#progress'}`;
+    await shell.openExternal(url);
+    return { url };
+  }
+  if (payload?.provider?.type === 'local') {
+    if (!activeShare || activeShare.roomId !== payload?.roomId) throw new Error('Share this room to open its browser tracker.');
+    const url = `${activeShare.baseUrl}/room/${activeShare.roomId}#progress`;
+    await shell.openExternal(url);
+    return { url };
+  }
   const url = rooms.trackerUrl(payload?.roomUrl, payload?.trackerId, payload?.slot);
   await shell.openExternal(url);
   return { url };
 }));
 
 ipcMain.handle('rooms:open-sphere-tracker', ipcResult(async (payload) => {
+  if (payload?.provider?.type === 'controller') {
+    const invitation = rooms.parseControllerInvite(payload?.provider?.roomUrl || payload?.roomUrl);
+    const url = `${invitation.url}#spheres`;
+    await shell.openExternal(url);
+    return { url };
+  }
+  if (payload?.provider?.type === 'local') {
+    if (!activeShare || activeShare.roomId !== payload?.roomId) throw new Error('Share this room to open its sphere tracker.');
+    const url = `${activeShare.baseUrl}/room/${activeShare.roomId}#spheres`;
+    await shell.openExternal(url);
+    return { url };
+  }
   if (payload?.provider?.type !== 'official' && payload?.provider) throw new Error('This room does not currently provide a sphere tracker.');
   const url = rooms.sphereTrackerUrl(payload?.roomUrl, payload?.trackerId);
   await shell.openExternal(url);
@@ -681,10 +841,37 @@ async function createTrackerWorkspace(payload) {
   }
 }
 
+async function roomLogicEnvironment(installRoot, game) {
+  const [worldInventory, components] = await Promise.all([
+    apWorldService.inventory(installRoot).catch(() => ({ installed: [], apVersion: '' })),
+    inventoryLauncherComponents(installRoot),
+  ]);
+  const normalizedGame = String(game || '').trim().toLocaleLowerCase();
+  const matchedWorld = worldInventory.installed?.find((world) => String(world.game).trim().toLocaleLowerCase() === normalizedGame);
+  const trackerWorld = worldInventory.installed?.find((world) => String(world.id).trim().toLocaleLowerCase() === 'tracker');
+  const trackerComponent = components.find((component) => component.displayName === 'Universal Tracker');
+  const world = matchedWorld ? `${matchedWorld.id}:${matchedWorld.version || ''}:${matchedWorld.sha256 || ''}` : '';
+  const tracker = trackerWorld ? `${trackerWorld.id}:${trackerWorld.version || ''}:${trackerWorld.sha256 || ''}` : `${trackerComponent?.sourceWorld || 'missing'}:${trackerComponent?.origin || ''}`;
+  return {
+    fingerprint: createHash('sha256').update(JSON.stringify({ apVersion: worldInventory.apVersion || '', world, tracker })).digest('hex'),
+    apVersion: worldInventory.apVersion || '', world, tracker, components,
+  };
+}
+
+ipcMain.handle('rooms:logic-environment', ipcResult(async (payload) => {
+  const environment = await roomLogicEnvironment(payload?.installRoot, payload?.game);
+  return { fingerprint: environment.fingerprint, apVersion: environment.apVersion, world: environment.world, tracker: environment.tracker };
+}));
+
 ipcMain.handle('rooms:tracker-dashboard', ipcResult(async (payload) => {
   if (payload?.provider?.type === 'local') {
     if (!trackerSidecar.running || trackerSidecar.roomId !== payload?.roomId) throw new Error('Start this room server to enable its live tracker.');
     return trackerSidecar.snapshot();
+  }
+  if (payload?.provider?.type === 'controller') {
+    const status = await rooms.refreshControllerRoom(net, payload?.provider?.roomUrl || payload?.roomUrl);
+    if (!status.snapshot?.enriched?.dashboard) throw new Error('This Controller host only supports the limited 0.1 room API.');
+    return status.snapshot.enriched.dashboard;
   }
   if (payload?.provider?.type !== 'official' && payload?.provider) throw new Error('Live tracker data is not enabled for this room provider yet.');
   const room = rooms.parseRoomUrl(payload?.roomUrl);
@@ -703,6 +890,17 @@ ipcMain.handle('rooms:tracker-dashboard', ipcResult(async (payload) => {
     catch (error) { trackerPackageCache.delete(checksum); throw error; }
   }));
   return rooms.normalizeTrackerDashboard(dynamic, fixed, payload?.slots, packages);
+}));
+ipcMain.handle('rooms:spheres', ipcResult(async (payload) => {
+  if (payload?.provider?.type === 'local') {
+    if (activeShare?.roomId !== payload?.roomId || !activeSphereSnapshot) return { refreshedAt: new Date().toISOString(), available: false, reason: 'not-running', checks: [] };
+    return activeSphereSnapshot;
+  }
+  if (payload?.provider?.type === 'controller') {
+    const status = await rooms.refreshControllerRoom(net, payload?.provider?.roomUrl || payload?.roomUrl);
+    return status.snapshot?.enriched?.spheres ?? { refreshedAt: status.refreshedAt, available: false, reason: 'incompatible', checks: [] };
+  }
+  return { refreshedAt: new Date().toISOString(), available: false, reason: 'incompatible', checks: [] };
 }));
 
 ipcMain.handle('rooms:launch-universal-tracker', ipcResult(async (payload) => {
@@ -736,22 +934,76 @@ ipcMain.handle('rooms:analyze-universal-tracker', ipcResult(async (payload) => {
   const { workspace, templateUsed } = await createTrackerWorkspace(payload);
   activeGeneratorJobs += 1;
   try {
+    const analysisKey = `${String(payload?.roomId)}:${String(payload?.slotName)}`;
+    activeLogicAnalyses.get(analysisKey)?.kill();
     const output = await new Promise((resolve, reject) => {
       const child = spawn(launcher, ['Universal Tracker', '--', '--nogui', '--count', '--list', uri], { cwd: workspace, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      activeLogicAnalyses.set(analysisKey, child);
       let text = '';
       const append = (chunk) => { if (text.length < 4 * 1024 * 1024) text += chunk.toString(); };
       child.stdout.on('data', append);
       child.stderr.on('data', append);
       const timer = setTimeout(() => { child.kill(); reject(new Error('Universal Tracker analysis timed out after 180 seconds.')); }, 180_000);
       child.once('error', (error) => { clearTimeout(timer); reject(error); });
-      child.once('close', () => { clearTimeout(timer); resolve(text); });
+      child.once('close', (code, signal) => { clearTimeout(timer); activeLogicAnalyses.delete(analysisKey); if (signal) reject(new Error('Universal Tracker analysis was cancelled.')); else resolve(text); });
     });
     const sanitized = password ? String(output).split(password).join('[redacted]') : String(output);
-    return { status, templateUsed, analyzedAt: new Date().toISOString(), ...parseUniversalTrackerOutput(sanitized) };
+    const environment = await roomLogicEnvironment(payload?.installRoot, payload?.game);
+    const fingerprint = createHash('sha256').update(JSON.stringify({
+      roomId: payload?.roomId, slot: payload?.slotName, game: payload?.game, endpoint,
+      yaml: String(payload?.yamlContent || ''), environment: environment.fingerprint,
+      roomState: String(payload?.stateFingerprint || ''),
+    })).digest('hex');
+    const analysis = { status, templateUsed, fingerprint, stateFingerprint: String(payload?.stateFingerprint || ''), yamlFingerprint: contentFingerprint(String(payload?.yamlContent || '')), environmentFingerprint: environment.fingerprint, stale: false, analyzedAt: new Date().toISOString(), ...parseUniversalTrackerOutput(sanitized) };
+    if (activeShare?.roomId === payload?.roomId) {
+      roomPortal.updateLogic(payload?.slot, analysis);
+      const target = path.join(activeShare.folderPath, 'logic-analyses.json');
+      let saved = {};
+      try { saved = JSON.parse(await fs.readFile(target, 'utf8')); } catch { /* First analysis. */ }
+      saved[String(payload?.slot)] = analysis;
+      await fs.writeFile(target, JSON.stringify(saved), 'utf8');
+    }
+    return analysis;
   } finally {
     activeGeneratorJobs -= 1;
     await fs.rm(workspace, { recursive: true, force: true });
   }
+}));
+ipcMain.handle('rooms:cancel-universal-tracker', ipcResult(async (payload) => {
+  const key = `${String(payload?.roomId)}:${String(payload?.slotName)}`;
+  const child = activeLogicAnalyses.get(key);
+  if (!child) return { cancelled: false };
+  child.kill();
+  activeLogicAnalyses.delete(key);
+  return { cancelled: true };
+}));
+
+ipcMain.handle('rooms:install-required-apworld', ipcResult(async (payload) => {
+  const worldId = String(payload?.worldId || '');
+  if (!['tracker', 'slotlock'].includes(worldId)) throw new Error('Only Universal Tracker and SlotLock can be installed from a room action.');
+  const [catalog, inventory] = await Promise.all([apWorldService.getCatalog({ maxAgeMs: 24 * 60 * 60 * 1000 }), apWorldService.inventory(payload?.installRoot)]);
+  const entry = catalog.entries.find((item) => item.id === worldId);
+  if (!entry) throw new Error('This tool is not available in the cached APWorld catalog. Refresh APWorlds and try again.');
+  const compatible = entry.releases.filter((release) => {
+    const minimum = release.minimumApVersion;
+    const maximum = release.maximumApVersion;
+    const version = inventory.apVersion;
+    const parts = (value) => String(value || '').split(/[^0-9]+/).filter(Boolean).map(Number);
+    const compare = (left, right) => { const a = parts(left); const b = parts(right); for (let i = 0; i < Math.max(a.length, b.length); i += 1) { const delta = (a[i] || 0) - (b[i] || 0); if (delta) return delta; } return 0; };
+    return (!minimum || compare(version, minimum) >= 0) && (!maximum || compare(version, maximum) <= 0);
+  });
+  if (!compatible.length) return { installed: false, sourceUrl: entry.sourceUrl, error: 'No indexed release is compatible with this Archipelago installation.' };
+  const release = compatible[0];
+  await apWorldService.install({ installRoot: payload?.installRoot, worldId, releaseId: release.id });
+  return { installed: true, releaseId: release.id, inventory: await apWorldService.inventory(payload?.installRoot), components: await inventoryLauncherComponents(payload?.installRoot) };
+}));
+ipcMain.handle('rooms:host-api-key', ipcResult(async (payload) => {
+  const secretRef = String(payload?.secretRef || 'room-host-api-key');
+  if (!/^[A-Za-z0-9:_-]{3,120}$/.test(secretRef)) throw new Error('Invalid host API secret reference.');
+  if (payload?.remove) { await setSecret(secretRef, ''); return { configured: false }; }
+  const key = randomBytes(32).toString('base64url');
+  await setSecret(secretRef, key);
+  return { configured: true, key };
 }));
 ipcMain.handle('poptracker:inventory', ipcResult((executablePath) => inventoryPopTracker(executablePath)));
 ipcMain.handle('rooms:launch-poptracker', ipcResult(async (payload) => {

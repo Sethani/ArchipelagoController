@@ -3,5 +3,6 @@ dist/
 release/
 release-fixed/
 tmp/
+local-contracts/
 *.log
 .DS_Store

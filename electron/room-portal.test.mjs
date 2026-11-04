@@ -23,7 +23,7 @@ describe('Controller room portal', () => {
   });
 
   it('runs the listening hook before automatic mapping', async () => {
-    const portal = createRoomPortal({ patchArchive });
+    const portal = createRoomPortal({ patchArchive, onWake: async () => ({ status: 'starting' }) });
     portals.push(portal);
     let listening = false;
     const result = await portal.start({
@@ -44,11 +44,13 @@ describe('Controller room portal', () => {
       'payload.bin': new Uint8Array([1, 2, 3]),
     }));
     await writeFile(source, original);
-    const portal = createRoomPortal({ patchArchive });
+    const portal = createRoomPortal({ patchArchive, onWake: async () => ({ status: 'starting' }) });
     portals.push(portal);
     const result = await portal.start({
       roomId: 'room-test-123', label: 'Test Room', generationId: 'seed-1', portalPort: 0,
       automaticPortMapping: false, serverRunning: true, passwordRequired: true, createdAt: '2026-10-20T08:00:00.000Z',
+      allowRemoteWake: true, wakeNonce: 'test-wake-nonce', hostApiKey: 'test-host-api-key',
+      sourceMetadata: { artifactSha256: 'abc123', seedName: 'Test Seed', slotCount: 1, games: ['Test Game'], raceMode: false },
       endpoint: { host: 'example.test', port: 38281, secure: false },
       slots: [{ slot: 1, name: 'Player', game: 'Test Game', files: [{ id: 'file_test_123', name: 'player.apgame', path: source, kind: 'downloaded', size: original.length }] }],
     });
@@ -62,9 +64,28 @@ describe('Controller room portal', () => {
     expect(roomPage).toContain('Recent room activity');
     expect(roomPage).toContain('Sphere tracker');
     expect(roomPage).toContain('Open in Controller');
+    expect(roomPage).toContain('/api/controller/v2/room/');
+    expect(roomPage).not.toContain('/api/controller/v1/room/');
     const status = await (await fetch(`${base}/status`)).json();
     expect(status).toMatchObject({ apiVersion: 1, provider: 'controller', label: 'Test Room', state: 'Online', passwordRequired: true, createdAt: '2026-10-20T08:00:00.000Z', endpoint: { host: 'example.test', port: 38281 }, progress: { checksSeen: 0, itemsSeen: 0, totalsAvailable: false } });
     expect(status.startedAt).toBeTruthy();
+    const v2base = `http://127.0.0.1:${result.portalPort}/api/controller/v2/room/room-test-123`;
+    const snapshotResponse = await fetch(`${v2base}/snapshot`);
+    expect(snapshotResponse.headers.get('access-control-allow-origin')).toBe('*');
+    expect(snapshotResponse.headers.get('etag')).toBeTruthy();
+    const snapshot = await snapshotResponse.json();
+    expect(snapshot).toMatchObject({ apiVersion: 2, schemaVersion: '2.0.0', original: { lifecycle: 'Online' }, enriched: { capabilities: { progress: true, multipleFiles: true, remoteWake: true } } });
+    expect(JSON.stringify(snapshot)).not.toContain(source);
+    expect((await fetch(`${v2base}/snapshot`, { headers: { 'if-none-match': snapshotResponse.headers.get('etag') } })).status).toBe(304);
+    const schema = await (await fetch(`http://127.0.0.1:${result.portalPort}/api/controller/v2/schema`)).json();
+    expect(schema).toMatchObject({ $schema: expect.stringContaining('json-schema'), apiVersion: 2, properties: { original: expect.any(Object), enriched: expect.any(Object) } });
+    expect(await (await fetch(`${v2base}/actions/wake`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-controller-wake': 'test-wake-nonce' }, body: '{}' })).json()).toMatchObject({ status: 'starting' });
+    expect((await fetch(`http://127.0.0.1:${result.portalPort}/api/controller/v2/host/room/room-test-123/export`)).status).toBe(401);
+    const exportResponse = await fetch(`http://127.0.0.1:${result.portalPort}/api/controller/v2/host/room/room-test-123/export`, { headers: { authorization: 'Bearer test-host-api-key' } });
+    expect(exportResponse.status).toBe(200);
+    const hostExport = await exportResponse.json();
+    expect(hostExport).toMatchObject({ source: { seedName: 'Test Seed', artifactSha256: 'abc123' }, protocol: { endpoint: { host: 'example.test' } }, tracker: expect.any(Object), logic: {} });
+    expect(JSON.stringify(hostExport)).not.toContain(source);
     portal.updatePresence('Player joined the game');
     portal.updatePresence('Player checked Test Location');
     portal.updatePresence('[Hint]: Player was hinted Test Item at Test Location');

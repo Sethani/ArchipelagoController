@@ -65,4 +65,18 @@ describe('local tracker sidecar', () => {
     expect(FakeSocket.instances).toHaveLength(2);
     sidecar.stop();
   });
+
+  it('opens only one tracker session for duplicate configured slots', () => {
+    FakeSocket.instances = [];
+    const sidecar = createTrackerSidecar({ createSocket: (url) => new FakeSocket(url) });
+    const snapshot = sidecar.start({ roomId: 'duplicate-room', port: 38281, slots: [
+      { slot: 1, name: 'Player_MC', game: 'Minecraft' },
+      { slot: 1, name: 'Player_MC', game: 'Minecraft' },
+      { slot: 2, name: 'player_mc', game: 'Minecraft' },
+      { slot: 3, name: 'Player_TW', game: 'The Witness' },
+    ] });
+    expect(FakeSocket.instances).toHaveLength(2);
+    expect(snapshot.players.map((player) => player.name)).toEqual(['Player_MC', 'Player_TW']);
+    sidecar.stop();
+  });
 });

@@ -189,6 +189,10 @@ export type Settings = {
   roomGatewayHostname: string;
   roomGatewayEmail: string;
   roomGatewayPublicUrl: string;
+  roomHostApiRemote: boolean;
+  allowSpoilerApi: boolean;
+  roomHostApiKeyRef?: string;
+  roomHostApiKeySet: boolean;
 };
 
 export type RoomFile = {
@@ -208,6 +212,58 @@ export type ManagedRoomSlot = {
   mine: boolean;
   downloadAvailable: boolean;
   files: RoomFile[];
+  remoteFiles?: RoomRemoteFile[];
+};
+
+export type RoomRemoteFile = {
+  id: string;
+  sourceId: string;
+  revision: string;
+  name: string;
+  size: number;
+  kind: RoomFile['kind'];
+  downloadedFileId?: string;
+};
+
+export type RoomProviderCapabilities = {
+  apiVersion: number;
+  progress: boolean;
+  hints: boolean;
+  activity: boolean;
+  spheres: boolean;
+  multipleFiles: boolean;
+  browserTrackers: boolean;
+  logicAnalysis: boolean;
+  remoteWake: boolean;
+};
+
+export type RoomActivityEvent = {
+  id: string;
+  timestamp: string;
+  type: string;
+  message: string;
+  slot?: number;
+};
+
+export type RoomSphereCheck = {
+  sphere: number;
+  finderSlot: number;
+  finderName: string;
+  finderGame: string;
+  receiverSlot: number;
+  receiverName: string;
+  receiverGame: string;
+  itemId: number;
+  item: string;
+  locationId: number;
+  location: string;
+};
+
+export type RoomSphereSnapshot = {
+  refreshedAt: string;
+  available: boolean;
+  reason?: 'old-seed' | 'absent' | 'malformed' | 'incompatible' | 'not-running';
+  checks: RoomSphereCheck[];
 };
 
 export type RoomTrackerPlayer = {
@@ -260,7 +316,46 @@ export type RoomLogicAnalysis = {
   locations: string[];
   analyzedAt: string;
   templateUsed: boolean;
+  fingerprint?: string;
+  stateFingerprint?: string;
+  yamlFingerprint?: string;
+  environmentFingerprint?: string;
+  stale?: boolean;
+  error?: string;
 };
+
+export type RoomOriginalState = {
+  lifecycle: string;
+  endpoint?: RoomEndpoint;
+  passwordRequired: boolean;
+  slots: Array<{ slot: number; name: string; game: string; connected: boolean; files: RoomRemoteFile[] }>;
+  observedAt: string;
+  sourceRevision: string;
+};
+
+export type RoomEnrichedState = {
+  dashboard: RoomTrackerDashboard;
+  activity: RoomActivityEvent[];
+  spheres: RoomSphereSnapshot;
+  logic: Record<string, RoomLogicAnalysis>;
+  capabilities: RoomProviderCapabilities;
+};
+
+export type ControllerRoomSnapshot = {
+  apiVersion: 2;
+  schemaVersion: string;
+  roomId: string;
+  label: string;
+  generationId?: string;
+  refreshedAt: string;
+  stale: boolean;
+  original: RoomOriginalState;
+  enriched: RoomEnrichedState;
+};
+
+export type RoomWakeStatus = 'disabled' | 'starting' | 'online' | 'busy' | 'failed' | 'host unavailable';
+export type RoomApiAccessSettings = { remoteEnabled: boolean; allowSpoilers: boolean; apiKeySet: boolean };
+export type RoomApiExport = { snapshot: ControllerRoomSnapshot; diagnostics?: Record<string, unknown>; source?: Record<string, unknown> };
 
 export type RoomStatusSnapshot = {
   trackerId?: string;
@@ -271,6 +366,10 @@ export type RoomStatusSnapshot = {
   refreshedAt: string;
   stale: boolean;
   error?: string;
+  capabilities?: RoomProviderCapabilities;
+  limitedHost?: boolean;
+  snapshot?: ControllerRoomSnapshot;
+  passwordRequired?: boolean;
 };
 
 export type RoomProviderType = 'official' | 'local' | 'controller';
@@ -280,6 +379,7 @@ export type RoomProviderDescriptor = {
   roomUrl?: string;
   historyRunId?: string;
   apiVersion?: number;
+  capabilities?: RoomProviderCapabilities;
 };
 
 export type RoomEndpoint = {
@@ -326,6 +426,7 @@ export type HostedRoomConfig = {
   insecureHttpAccepted: boolean;
   sharedSlots: number[];
   shareStatus: RoomShareStatus;
+  allowRemoteWake?: boolean;
 };
 
 export type RoomInvite = {
@@ -403,11 +504,13 @@ export type ManagedRoom = {
   createdAt: string;
   passwordRef?: string;
   passwordSet: boolean;
+  passwordRequired?: boolean;
   autoLoginWarningAccepted: boolean;
   slots: ManagedRoomSlot[];
   status: RoomStatusSnapshot;
   provider?: RoomProviderDescriptor;
   hosted?: HostedRoomConfig;
+  logicAnalyses?: Record<number, RoomLogicAnalysis>;
 };
 
 export type HostSettings = {

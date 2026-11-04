@@ -1,4 +1,4 @@
-import type { AppState } from '../types';
+import type { AppState, ManagedRoomSlot } from '../types';
 import { normalizeLegacySlotName, yamlFingerprint } from './session';
 import { migrateMainRelativeSettings } from './paths';
 import { defaultSlotLockOptions } from './slotlock';
@@ -10,6 +10,31 @@ function withoutLegacyAccessToken<T extends object>(value: T): T {
   delete migrated.accessTokenRef;
   delete migrated.accessTokenSet;
   return migrated;
+}
+
+function deduplicateRoomSlots(slots: ManagedRoomSlot[]): ManagedRoomSlot[] {
+  const result: ManagedRoomSlot[] = [];
+  const indexes = new Map<string, number>();
+  for (const slot of slots) {
+    const keys = [`slot:${Number(slot.slot)}`, `name:${String(slot.name).trim().toLocaleLowerCase()}`];
+    const existingIndex = keys.map((key) => indexes.get(key)).find((index) => index !== undefined);
+    if (existingIndex !== undefined) {
+      const existing = result[existingIndex];
+      result[existingIndex] = {
+        ...existing,
+        mine: existing.mine || slot.mine,
+        downloadAvailable: existing.downloadAvailable || slot.downloadAvailable,
+        files: [...new Map([...existing.files, ...slot.files].map((file) => [file.id || file.path || file.name, file])).values()],
+        remoteFiles: [...new Map([...(existing.remoteFiles ?? []), ...(slot.remoteFiles ?? [])].map((file) => [file.id || file.sourceId || file.name, file])).values()],
+      };
+      for (const key of keys) indexes.set(key, existingIndex);
+      continue;
+    }
+    const index = result.length;
+    result.push(slot);
+    for (const key of keys) indexes.set(key, index);
+  }
+  return result;
 }
 
 export const initialState: AppState = {
@@ -37,6 +62,9 @@ export const initialState: AppState = {
     roomGatewayHostname: '',
     roomGatewayEmail: '',
     roomGatewayPublicUrl: '',
+    roomHostApiRemote: false,
+    allowSpoilerApi: false,
+    roomHostApiKeySet: false,
   },
   host: {
     host: '',
@@ -109,8 +137,10 @@ export function loadState(): AppState {
         ...room,
         provider: room.provider ? withoutLegacyAccessToken(room.provider) : { type: 'official', roomUrl: room.url },
         passwordSet: Boolean(room.passwordSet),
+        passwordRequired: Boolean(room.passwordRequired ?? room.status?.passwordRequired),
         autoLoginWarningAccepted: Boolean(room.autoLoginWarningAccepted),
-        slots: (room.slots ?? []).map((slot) => ({ ...slot, mine: Boolean(slot.mine), files: slot.files ?? [] })),
+        logicAnalyses: room.logicAnalyses ?? {},
+        slots: deduplicateRoomSlots((room.slots ?? []).map((slot) => ({ ...slot, mine: Boolean(slot.mine), files: slot.files ?? [], remoteFiles: slot.remoteFiles ?? [] }))),
         status: { ...room.status, stale: room.status?.stale ?? true },
         hosted: room.hosted ? {
           ...withoutLegacyAccessToken(room.hosted),
@@ -119,6 +149,7 @@ export function loadState(): AppState {
           automaticPortMapping: room.hosted.automaticPortMapping ?? true,
           insecureHttpAccepted: Boolean(room.hosted.insecureHttpAccepted),
           sharedSlots: room.hosted.sharedSlots ?? [],
+          allowRemoteWake: Boolean(room.hosted.allowRemoteWake),
           shareStatus: { state: 'offline', serverRunning: false, portalRunning: false, mapping: 'unknown', reachability: 'unknown' },
         } : undefined,
       })),
