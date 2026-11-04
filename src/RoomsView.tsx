@@ -264,6 +264,18 @@ export function RoomsView({ rooms, templates, settings, roomsRoot, setRooms, not
   };
 
   const loadTrackerDashboard = async (room: ManagedRoom, quiet = false) => {
+    if (window.archipelago?.getBrokerRoom) {
+      if (!quiet) setTrackerBusy(true);
+      const broker = await window.archipelago.getBrokerRoom({ roomId: room.id });
+      if (!('error' in broker && broker.ok === false)) {
+        setTrackerDashboard(broker.snapshot.enriched.dashboard);
+        setSphereData(broker.snapshot.enriched.spheres);
+        setTrackerError('');
+        if (!quiet) setTrackerBusy(false);
+        return;
+      }
+      if (!quiet) setTrackerBusy(false);
+    }
     if (room.provider?.type !== 'official' && window.archipelago?.getRoomSpheres) {
       const spheres = await window.archipelago.getRoomSpheres({ roomId: room.id, roomUrl: room.provider?.roomUrl ?? room.url, provider: room.provider });
       if (!('error' in spheres && spheres.ok === false)) setSphereData(spheres);
@@ -326,15 +338,26 @@ export function RoomsView({ rooms, templates, settings, roomsRoot, setRooms, not
 
   const refresh = async (room: ManagedRoom, wake = false, quiet = false) => {
     if (!window.archipelago) return room;
-    if (room.provider?.type === 'local') {
-      const running = hostRunning && activeHostRoomId === room.id;
-      const next = { ...room, status: { ...room.status, lastPort: room.hosted?.gamePort, endpoint: running ? { host: 'localhost', port: room.hosted?.gamePort ?? 38281, secure: false } : undefined, refreshedAt: new Date().toISOString(), stale: false } };
+    if (!quiet) setBusy(`refresh:${room.id}`);
+    const broker = await window.archipelago.getBrokerRoom({ roomId: room.id, force: true, wake });
+    if (!('error' in broker && broker.ok === false)) {
+      const snapshotSlots = broker.snapshot.original.slots.map((slot) => ({
+        slot: slot.slot, name: slot.name, game: slot.game, downloadAvailable: slot.files.length > 0, remoteFiles: slot.files,
+      }));
+      const next = {
+        ...room,
+        slots: mergeSlots(room, { ...broker.status, roomId: room.id, url: room.url, slots: snapshotSlots, refreshedAt: broker.snapshot.refreshedAt, stale: broker.snapshot.stale }),
+        status: { ...room.status, ...broker.status, snapshot: broker.snapshot, refreshedAt: broker.snapshot.refreshedAt, stale: broker.snapshot.stale, error: broker.error },
+      };
       replaceRoom(next);
-      await syncFiles(next);
+      if (room.provider?.type === 'local') await syncFiles(next);
+      if (!quiet) notify(next.status.lastPort ? `Room available on port ${next.status.lastPort}` : 'Room refreshed, but no server port is active');
+      if (!quiet) setBusy('');
       return next;
     }
-    if (!quiet) setBusy(`refresh:${room.id}`);
-    const result = await window.archipelago.inspectRoom({ url: room.provider?.roomUrl ?? room.url, wake });
+    const result = room.provider?.type === 'local'
+      ? { ok: false as const, error: broker.error }
+      : await window.archipelago.inspectRoom({ url: room.provider?.roomUrl ?? room.url, wake });
     if ('error' in result && result.ok === false) {
       const stale = { ...room, status: { ...room.status, stale: true, error: result.error } };
       replaceRoom(stale);
@@ -420,7 +443,7 @@ export function RoomsView({ rooms, templates, settings, roomsRoot, setRooms, not
       id: inspection.roomId, label: label.trim() || `Room ${inspection.roomId.slice(0, 8)}`, url: inspection.url,
       folderPath: ensured.folderPath, createdAt: new Date().toISOString(), passwordRef, passwordSet: Boolean(password),
       passwordRequired: inspection.passwordRequired,
-      autoLoginWarningAccepted: false, status: statusFrom(inspection),
+      autoLoginWarningAccepted: false, apiVisible: true, status: statusFrom(inspection),
       provider: inspection.provider ?? { type: 'official', roomUrl: inspection.url },
       slots: inspection.slots.map((slot) => ({ ...slot, mine: mine.includes(slot.slot), files: [] })),
     };
@@ -642,7 +665,7 @@ export function RoomsView({ rooms, templates, settings, roomsRoot, setRooms, not
       installRoot: settings.installRoot, roomsRoot, roomId: room.id, label: room.label, folderPath: room.folderPath, slots: room.slots,
       sharedSlots: room.hosted.sharedSlots, hosted: room.hosted, createdAt: room.createdAt, passwordRequired: room.passwordSet,
       gateway: { mode: settings.roomGatewayMode, hostname: settings.roomGatewayHostname, email: settings.roomGatewayEmail, publicBaseUrl: settings.roomGatewayPublicUrl },
-      hostApi: { secretRef: settings.roomHostApiKeyRef, remoteEnabled: settings.roomHostApiRemote, allowSpoilers: settings.allowSpoilerApi },
+      hostApi: { secretRef: settings.roomHostApiKeyRef, remoteEnabled: settings.roomDataApiRemote, allowSpoilers: settings.allowSpoilerApi },
     });
     setBusy('');
     if (!result || result.error && !result.portalRunning) { notify(result?.error ?? 'Room portal could not start'); return; }
@@ -728,6 +751,7 @@ export function RoomsView({ rooms, templates, settings, roomsRoot, setRooms, not
         <header className="room-heading"><div><h1>{selected.label}</h1><p>{selected.provider?.type === 'local' ? 'Controller-hosted room' : selected.url} · Refreshed {compactDate(selected.status.refreshedAt)}</p></div><div className="room-heading-actions"><span className="status-chip neutral">{selected.provider?.type ?? 'official'}</span><span className={`status-chip ${selected.status.stale ? 'warn' : selected.provider?.type === 'local' ? hostRunning && activeHostRoomId === selected.id ? 'good' : 'neutral' : selected.status.lastPort ? 'good' : 'neutral'}`}>{selected.status.stale ? 'Stale' : selected.provider?.type === 'local' ? hostRunning && activeHostRoomId === selected.id ? `Port ${selected.hosted?.gamePort}` : 'Offline' : selected.status.lastPort ? `Port ${selected.status.lastPort}` : 'No active port'}</span><button className="icon-button" title="Refresh room" onClick={() => void refresh(selected, true).then(syncFiles)}>{busy === `refresh:${selected.id}` ? <LoaderCircle className="spin" size={15} /> : <RefreshCcw size={15} />}</button><button className="icon-button" title="Copy room connection" onClick={() => void copyConnection(selected)}><Clipboard size={15} /></button><button className="icon-button" title="Open room folder" onClick={() => void window.archipelago?.reveal(selected.folderPath)}><FolderOpen size={15} /></button>{selected.provider?.type === 'official' && <button className="icon-button" title="Open room page" onClick={() => void window.archipelago?.openExternal(selected.url)}><ExternalLink size={15} /></button>}{selected.provider?.type === 'local' && selected.hosted?.shareStatus.portalRunning && <button className="icon-button" title="Open shared room page" onClick={() => void window.archipelago?.openRoomShare({ roomId: selected.id })}><ExternalLink size={15} /></button>}<button className="icon-button danger" title="Forget room" onClick={() => void forget(selected)}><Trash2 size={15} /></button></div></header>
         {selected.status.error && <div className="room-error">{selected.status.error} Last successful room data is still shown.</div>}
         {selected.status.limitedHost && <div className="room-error">Limited 0.1 host — endpoint, downloads, and launching work, but rich progress, spheres, logic, and remote wake require Controller 0.2.0 on the host.</div>}
+        <div className="room-remote-wake"><label><input type="checkbox" checked={selected.apiVisible !== false} onChange={(event) => replaceRoom({ ...selected, apiVisible: event.target.checked })} /><span className="custom-check">{selected.apiVisible !== false && <Check size={11} />}</span><span><strong>Expose through Room data API</strong><small>Other software can read this room from Controller's normalized local API.</small></span></label></div>
         <div className="room-password-control"><span><strong>Room password{selected.passwordRequired ? ' required' : ''}</strong><small>{selected.passwordSet ? 'Saved securely on this computer' : selected.passwordRequired ? 'This room requires a password before clients can connect' : 'Not configured'}</small></span><input type="password" value={roomPasswordDraft} onChange={(event) => setRoomPasswordDraft(event.target.value)} placeholder={selected.passwordSet ? 'Enter a replacement' : 'Enter password if required'} /><button className="secondary-button" disabled={!roomPasswordDraft} onClick={() => void saveRoomPassword(selected)}>Save</button>{selected.passwordSet && <button className="text-button danger" onClick={() => void saveRoomPassword(selected, true)}>Remove</button>}</div>
         {selected.provider?.type === 'local' && selected.hosted && <section className="internet-hosting"><div className="internet-hosting-heading"><div><Globe2 size={18} /><span><strong>Internet Hosting</strong><small>Run the game server and share selected slot downloads.</small></span></div><div className="internet-hosting-actions">{hostRunning && activeHostRoomId === selected.id ? <button className="secondary-button" onClick={stopLocal}><Power size={14} />Stop server</button> : <button className="primary-button" disabled={hostRunning && activeHostRoomId !== selected.id} onClick={() => startLocal(selected)}><Play size={14} />Start server</button>}{selected.hosted.shareStatus.portalRunning ? <button className="secondary-button" onClick={() => void stopSharing(selected)}><Power size={14} />Stop sharing</button> : settings.roomGatewayMode !== 'local' && <button className="primary-button" disabled={busy === 'share' || !gatewayReady} onClick={() => void startSharing(selected)}>{busy === 'share' ? <LoaderCircle className="spin" size={14} /> : <Share2 size={14} />}Share room</button>}</div></div><div className="internet-hosting-grid"><label>Public game hostname<input value={settings.roomGatewayMode === 'managed' ? settings.roomGatewayHostname : selected.hosted.advertisedHost} disabled={settings.roomGatewayMode === 'managed' || selected.hosted.shareStatus.portalRunning} onChange={(event) => updateHosted(selected, { advertisedHost: event.target.value.trim() })} placeholder="Automatic when UPnP succeeds" /></label><label>Raw game port<input type="number" min={1} max={65535} value={selected.hosted.gamePort} disabled={hostRunning || selected.hosted.shareStatus.portalRunning} onChange={(event) => updateHosted(selected, { gamePort: Number(event.target.value) })} /></label><label>Portal port<input type="number" min={1} max={65535} value={selected.hosted.portalPort} disabled={selected.hosted.shareStatus.portalRunning} onChange={(event) => updateHosted(selected, { portalPort: Number(event.target.value) })} /></label><label>Room gateway<input value={gatewayLabel} readOnly /></label></div><div className="internet-hosting-options"><label><input type="checkbox" checked={selected.hosted.automaticPortMapping} disabled={selected.hosted.shareStatus.portalRunning} onChange={(event) => updateHosted(selected, { automaticPortMapping: event.target.checked })} /><span className="custom-check">{selected.hosted.automaticPortMapping && <Check size={11} />}</span>Automatic UPnP / NAT-PMP mapping</label>{settings.roomGatewayMode === 'direct' && <label className="http-warning"><input type="checkbox" checked={selected.hosted.insecureHttpAccepted} disabled={selected.hosted.shareStatus.portalRunning} onChange={(event) => updateHosted(selected, { insecureHttpAccepted: event.target.checked })} /><span className="custom-check">{selected.hosted.insecureHttpAccepted && <Check size={11} />}</span>I understand direct HTTP invitations are not encrypted</label>}{settings.roomGatewayMode === 'local' && <span className="local-sharing-note">Choose a public gateway in Settings to create internet invitations.</span>}</div><div className="share-status-row"><span>Server <b>{hostRunning && activeHostRoomId === selected.id ? 'Online' : 'Offline'}</b></span><span>Portal <b>{selected.hosted.shareStatus.portalRunning ? 'Online' : 'Offline'}</b></span><span>Firewall <b>{selected.hosted.shareStatus.firewall ?? 'unused'}</b></span><span>Gateway <b>{selected.hosted.shareStatus.gateway ?? 'disabled'}</b></span><span>Certificate <b>{selected.hosted.shareStatus.certificate ?? 'unused'}</b></span>{selected.hosted.shareStatus.secureGameEndpoint && <span>Secure game <b>{selected.hosted.shareStatus.secureGameEndpoint}</b></span>}{selected.hosted.shareStatus.compatibilityGameEndpoint && <span>Legacy web clients <b>{selected.hosted.shareStatus.compatibilityGameEndpoint}</b></span>}<span>Mapping <b>{selected.hosted.shareStatus.mapping}</b></span><span>Reachability <b>{selected.hosted.shareStatus.reachability}</b></span>{(selected.hosted.shareStatus.gatewayError || selected.hosted.shareStatus.error) && <span className="share-error">{selected.hosted.shareStatus.gatewayError || selected.hosted.shareStatus.error}</span>}</div><div className="shared-slots"><strong>Download permissions</strong><span className="shared-slots-note">{selected.hosted.shareStatus.portalRunning ? 'Stop sharing to change download permissions.' : 'All room slots stay visible; choose which patches guests can download.'}</span>{selected.slots.filter((slot) => slot.files.some((file) => ['downloaded', 'imported'].includes(file.kind))).map((slot) => <label key={slot.slot}><input type="checkbox" checked={selected.hosted!.sharedSlots.includes(slot.slot)} disabled={selected.hosted!.shareStatus.portalRunning} onChange={() => updateHosted(selected, { sharedSlots: selected.hosted!.sharedSlots.includes(slot.slot) ? selected.hosted!.sharedSlots.filter((value) => value !== slot.slot) : [...selected.hosted!.sharedSlots, slot.slot] })} /><span className="custom-check">{selected.hosted!.sharedSlots.includes(slot.slot) && <Check size={11} />}</span>{slot.name} · {slot.game}</label>)}</div>{selected.hosted.shareStatus.portalRunning && <div className="invite-actions"><button className="secondary-button" onClick={() => void copyInvite(selected, 'browser')}><Clipboard size={14} />Browser invite</button><button className="secondary-button" onClick={() => void copyInvite(selected, 'controller')}><Clipboard size={14} />Controller invite</button>{selected.hosted.shareStatus.secureGameEndpoint && <button className="secondary-button" onClick={() => void copySecureEndpoint(selected)}><Clipboard size={14} />Secure game</button>}<span>{selected.hosted.shareStatus.publicUrl}</span></div>}</section>}
         {selected.provider?.type === 'local' && selected.hosted && <div className="room-remote-wake"><label><input type="checkbox" checked={Boolean(selected.hosted.allowRemoteWake)} disabled={selected.hosted.shareStatus.portalRunning} onChange={(event) => updateHosted(selected, { allowRemoteWake: event.target.checked })} /><span className="custom-check">{selected.hosted.allowRemoteWake && <Check size={11} />}</span><span><strong>Allow remote wake</strong><small>Anyone with the random room URL may start this room while sharing remains online.</small></span></label></div>}

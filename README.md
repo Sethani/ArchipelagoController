@@ -39,6 +39,16 @@ The default generator argument template is:
 
 Adjust it in Settings if the installed Archipelago release uses different command-line options.
 
+## Room data API
+
+While Controller is running, other software can read every API-visible saved room through the provider-neutral broker at:
+
+```text
+http://127.0.0.1:38283/api/controller/v2/rooms
+```
+
+This works for official Archipelago rooms, locally hosted rooms, and remote Controller rooms. Individual snapshots are available at `/rooms/<managed-room-id>/snapshot`, and the live OpenAPI contract is served at `/openapi.yaml`. Local read requests need no key; refresh/wake actions and optional network access use the bearer key configured under **Settings → Room data API**.
+
 ## Verification
 
 ```powershell

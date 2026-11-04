@@ -189,7 +189,11 @@ export type Settings = {
   roomGatewayHostname: string;
   roomGatewayEmail: string;
   roomGatewayPublicUrl: string;
-  roomHostApiRemote: boolean;
+  roomHostApiRemote?: boolean;
+  roomDataApiEnabled: boolean;
+  roomDataApiPort: number;
+  roomDataApiRemote: boolean;
+  roomDataApiAllowedOrigins: string;
   allowSpoilerApi: boolean;
   roomHostApiKeyRef?: string;
   roomHostApiKeySet: boolean;
@@ -349,9 +353,39 @@ export type ControllerRoomSnapshot = {
   generationId?: string;
   refreshedAt: string;
   stale: boolean;
+  error?: string;
   original: RoomOriginalState;
   enriched: RoomEnrichedState;
 };
+
+export type RoomBrokerSummary = {
+  id: string;
+  label: string;
+  provider: RoomProviderType;
+  lifecycle: string;
+  online: boolean;
+  stale: boolean;
+  endpoint?: RoomEndpoint;
+  refreshedAt?: string;
+  slots: number;
+  checksDone: number;
+  checksTotal: number;
+  completedPlayers: number;
+  unresolvedHints: number;
+  capabilities: RoomProviderCapabilities;
+  error?: string;
+};
+
+export type RoomBrokerState = {
+  running: boolean;
+  address: string;
+  port: number;
+  error?: string;
+};
+
+export type RoomBrokerError = { error: { code: string; message: string; retryable: boolean } };
+export type RoomProviderSnapshot = { status: RoomStatusSnapshot; snapshot: ControllerRoomSnapshot; refreshedAt: string; error?: string };
+export type RoomRefreshResult = RoomProviderSnapshot;
 
 export type RoomWakeStatus = 'disabled' | 'starting' | 'online' | 'busy' | 'failed' | 'host unavailable';
 export type RoomApiAccessSettings = { remoteEnabled: boolean; allowSpoilers: boolean; apiKeySet: boolean };
@@ -506,6 +540,7 @@ export type ManagedRoom = {
   passwordSet: boolean;
   passwordRequired?: boolean;
   autoLoginWarningAccepted: boolean;
+  apiVisible?: boolean;
   slots: ManagedRoomSlot[];
   status: RoomStatusSnapshot;
   provider?: RoomProviderDescriptor;

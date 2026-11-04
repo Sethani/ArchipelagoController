@@ -62,7 +62,10 @@ export const initialState: AppState = {
     roomGatewayHostname: '',
     roomGatewayEmail: '',
     roomGatewayPublicUrl: '',
-    roomHostApiRemote: false,
+    roomDataApiEnabled: true,
+    roomDataApiPort: 38283,
+    roomDataApiRemote: false,
+    roomDataApiAllowedOrigins: '',
     allowSpoilerApi: false,
     roomHostApiKeySet: false,
   },
@@ -89,6 +92,7 @@ export function loadState(): AppState {
     if (!saved) return initialState;
     const parsed = JSON.parse(saved) as Partial<AppState>;
     const savedSettings = parsed.settings ?? initialState.settings;
+    const { roomHostApiRemote: legacyRoomApiRemote, ...safeSavedSettings } = savedSettings;
     const normalizedTemplates = (parsed.templates ?? []).map((template) => ({
       ...template,
       slotName: normalizeLegacySlotName(template.fileName, template.path, template.slotName),
@@ -118,7 +122,11 @@ export function loadState(): AppState {
       selectedIds,
       settings: migrateMainRelativeSettings({
         ...initialState.settings,
-        ...savedSettings,
+        ...safeSavedSettings,
+        roomDataApiEnabled: savedSettings.roomDataApiEnabled ?? true,
+        roomDataApiPort: Number(savedSettings.roomDataApiPort) || 38283,
+        roomDataApiRemote: savedSettings.roomDataApiRemote ?? legacyRoomApiRemote ?? false,
+        roomDataApiAllowedOrigins: savedSettings.roomDataApiAllowedOrigins || '',
         popTrackerPath: savedSettings.popTrackerPath || '',
         emoTrackerPath: savedSettings.emoTrackerPath || '',
         libraryPath: savedSettings.libraryPath || initialState.settings.libraryPath,
@@ -135,6 +143,7 @@ export function loadState(): AppState {
       remoteProfiles: parsed.remoteProfiles ?? [],
       rooms: (parsed.rooms ?? []).map((room) => ({
         ...room,
+        apiVisible: room.apiVisible !== false,
         provider: room.provider ? withoutLegacyAccessToken(room.provider) : { type: 'official', roomUrl: room.url },
         passwordSet: Boolean(room.passwordSet),
         passwordRequired: Boolean(room.passwordRequired ?? room.status?.passwordRequired),

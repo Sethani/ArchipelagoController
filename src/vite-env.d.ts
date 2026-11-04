@@ -39,6 +39,9 @@ interface Window {
     launchApWorldComponent(payload: { installRoot: string; displayName: string }): Promise<{ ok: boolean; error?: string }>;
     openPatch(installRoot: string): Promise<{ ok: boolean; canceled?: boolean; error?: string }>;
     inspectRoom(payload: { url: string; wake?: boolean }): Promise<({ ok?: true; roomId: string; url: string; provider?: import('./types').RoomProviderDescriptor; trackerId?: string; lastPort?: number; endpoint?: import('./types').RoomEndpoint; lastActivity?: string; timeout?: number; refreshedAt: string; stale: boolean; passwordRequired?: boolean; limitedHost?: boolean; capabilities?: import('./types').RoomProviderCapabilities; snapshot?: import('./types').ControllerRoomSnapshot; slots: Array<{ slot: number; name: string; game: string; downloadAvailable: boolean; remoteFiles?: import('./types').RoomRemoteFile[] }> }) | { ok: false; error: string }>;
+    syncRoomBroker(payload: { rooms: import('./types').ManagedRoom[]; settings: { enabled: boolean; port: number; remoteEnabled: boolean; allowedOrigins: string[]; secretRef?: string } }): Promise<(import('./types').RoomBrokerState & { ok?: true }) | { ok: false; error: string }>;
+    roomBrokerStatus(): Promise<import('./types').RoomBrokerState>;
+    getBrokerRoom(payload: { roomId: string; force?: boolean; wake?: boolean }): Promise<(import('./types').RoomProviderSnapshot & { ok?: true }) | { ok: false; error: string }>;
     takeRoomInvite(): Promise<string | null>;
     takeRoomApWorldInstall(): Promise<'tracker' | 'slotlock' | null>;
     wakeRoom(payload: { roomUrl: string; provider: import('./types').RoomProviderDescriptor }): Promise<{ ok?: true; status?: import('./types').RoomWakeStatus; error?: string }>;

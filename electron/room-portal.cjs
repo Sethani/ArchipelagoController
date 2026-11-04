@@ -386,7 +386,14 @@ function createRoomPortal({ patchArchive, onObserved = () => {}, onWake = async 
     logicAnalyses = { ...logicAnalyses, [String(slot)]: analysis };
   }
 
-  return { start, stop, updatePresence, updateTracker, updateSpheres, updateLogic, get running() { return Boolean(server?.listening); } };
+  function snapshot() {
+    return {
+      roomId: config?.roomId, live: liveState?.snapshot(), tracker: trackerSnapshot,
+      spheres: sphereSnapshot, logic: { ...logicAnalyses },
+    };
+  }
+
+  return { start, stop, updatePresence, updateTracker, updateSpheres, updateLogic, snapshot, get running() { return Boolean(server?.listening); } };
 }
 
 module.exports = { API_PREFIX, API_V2_PREFIX, SCHEMA_VERSION, createRoomPortal, localAddress, withTimeout };

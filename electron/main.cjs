@@ -12,6 +12,7 @@ const { createApUpdateService } = require('./ap-update.cjs');
 const { readHostConfig, writeHostConfig } = require('./host-config.cjs');
 const rooms = require('./rooms.cjs');
 const { createRoomPortal, localAddress } = require('./room-portal.cjs');
+const { createRoomBroker, SCHEMA_VERSION: ROOM_BROKER_SCHEMA_VERSION } = require('./room-broker.cjs');
 const { createHttpsGateway } = require('./https-gateway.cjs');
 const { createGatewayFirewall } = require('./gateway-firewall.cjs');
 const { inventoryPopTracker, popTrackerArgs } = require('./poptracker.cjs');
@@ -110,6 +111,7 @@ const yamlValidator = createYamlValidator({
   onBusy: (busy) => { validationBusy = busy; },
 });
 const apUpdateService = createApUpdateService({ app, net });
+const roomBroker = createRoomBroker({ app, resolveRoom: resolveBrokerRoom, wakeRoom: wakeBrokerRoom, getSecret });
 
 app.setAppUserModelId('io.archipelago.controller');
 if (process.defaultApp && process.argv[1]) app.setAsDefaultProtocolClient('archipelago-controller', process.execPath, [path.resolve(process.argv[1])]);
@@ -246,6 +248,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   await removeLegacyRoomAccessSecrets().catch(() => {});
+  await roomBroker.start().catch(() => {});
   createWindow();
   app.on('activate', () => BrowserWindow.getAllWindows().length === 0 && createWindow());
 });
@@ -257,6 +260,7 @@ app.on('before-quit', () => {
   remoteConsole?.socket?.close();
   if (activeHost && activeHost.exitCode === null) activeHost.kill();
   trackerSidecar.stop();
+  void roomBroker.stop();
   void roomPortal.stop();
   void httpsGateway.stop();
 });
@@ -481,6 +485,9 @@ ipcMain.handle('rooms:inspect', ipcResult(async (payload) => {
     return { ...status, provider: { type: 'controller', roomUrl: invitation.url, apiVersion: status.capabilities?.apiVersion ?? 1, capabilities: status.capabilities } };
   }
 }));
+ipcMain.handle('rooms:broker-sync', ipcResult(async (payload) => roomBroker.sync(payload)));
+ipcMain.handle('rooms:broker-status', () => roomBroker.state);
+ipcMain.handle('rooms:broker-room', ipcResult(async (payload) => roomBroker.inspect(payload?.roomId, { force: Boolean(payload?.force), wake: Boolean(payload?.wake) })));
 ipcMain.handle('rooms:take-invite', () => {
   const invite = pendingRoomInvite;
   pendingRoomInvite = undefined;
@@ -814,6 +821,160 @@ async function trackerJson(url) {
   const response = await net.fetch(url, { method: 'GET' });
   if (!response.ok) throw new Error(`Archipelago tracker returned HTTP ${response.status}.`);
   return response.json();
+}
+
+function emptyBrokerDashboard(slots, refreshedAt) {
+  const players = slots.map((slot) => ({
+    slot: Number(slot.slot), name: String(slot.name), game: String(slot.game), checksDone: 0, checksTotal: 0,
+    itemsReceived: 0, status: 0, statusLabel: 'Unknown', hintCount: 0, unresolvedHintCount: 0,
+  }));
+  return { refreshedAt, players, hints: [], checksDone: 0, checksTotal: 0, completedPlayers: 0, unresolvedHints: 0 };
+}
+
+function sanitizeBrokerDashboard(value, slots, refreshedAt) {
+  const dashboard = value && Array.isArray(value.players) ? value : emptyBrokerDashboard(slots, refreshedAt);
+  const players = dashboard.players.map((player) => ({
+    slot: Number(player.slot), name: String(player.name || `Slot ${player.slot}`), alias: player.alias ? String(player.alias) : undefined,
+    game: String(player.game || 'Unknown'), checksDone: Math.max(0, Number(player.checksDone) || 0), checksTotal: Math.max(0, Number(player.checksTotal) || 0),
+    itemsReceived: Math.max(0, Number(player.itemsReceived) || 0), status: Number(player.status) || 0,
+    statusLabel: String(player.statusLabel || 'Unknown'), lastActivity: player.lastActivity ? String(player.lastActivity) : undefined,
+    lastConnection: player.lastConnection ? String(player.lastConnection) : undefined,
+    hintCount: Math.max(0, Number(player.hintCount) || 0), unresolvedHintCount: Math.max(0, Number(player.unresolvedHintCount) || 0),
+  }));
+  const hints = Array.isArray(dashboard.hints) ? dashboard.hints.map((hint) => ({
+    receivingSlot: Number(hint.receivingSlot), receivingName: String(hint.receivingName || ''), findingSlot: Number(hint.findingSlot), findingName: String(hint.findingName || ''),
+    itemId: Number(hint.itemId), item: String(hint.item || ''), locationId: Number(hint.locationId), location: String(hint.location || ''),
+    found: Boolean(hint.found), entrance: String(hint.entrance || ''), flags: Number(hint.flags) || 0, status: Number(hint.status) || 0,
+    classification: String(hint.classification || 'Filler'), statusLabel: String(hint.statusLabel || 'Unspecified'),
+  })) : [];
+  return {
+    refreshedAt: String(dashboard.refreshedAt || refreshedAt), players, hints,
+    checksDone: players.reduce((sum, player) => sum + player.checksDone, 0), checksTotal: players.reduce((sum, player) => sum + player.checksTotal, 0),
+    completedPlayers: players.filter((player) => player.status === 30 || /finished|goal/i.test(player.statusLabel)).length,
+    unresolvedHints: hints.filter((hint) => !hint.found).length,
+  };
+}
+
+async function officialTrackerDashboard(room, status) {
+  const trackerId = String(status?.trackerId || '');
+  if (!/^[A-Za-z0-9_-]{6,100}$/.test(trackerId)) return undefined;
+  const parsed = rooms.parseRoomUrl(room.provider?.roomUrl || room.url);
+  const [dynamic, fixed] = await Promise.all([
+    trackerJson(`${parsed.origin}/api/tracker/${trackerId}`),
+    trackerJson(`${parsed.origin}/api/static_tracker/${trackerId}`),
+  ]);
+  const packages = {};
+  await Promise.all(Object.entries(fixed?.datapackage ?? {}).map(async ([game, descriptor]) => {
+    const checksum = String(descriptor?.checksum ?? '');
+    if (!/^[a-f0-9]{32,64}$/i.test(checksum)) return;
+    if (!trackerPackageCache.has(checksum)) trackerPackageCache.set(checksum, trackerJson(`${parsed.origin}/api/datapackage/${checksum}`));
+    try { packages[game] = await trackerPackageCache.get(checksum); }
+    catch (error) { trackerPackageCache.delete(checksum); throw error; }
+  }));
+  return rooms.normalizeTrackerDashboard(dynamic, fixed, room.slots, packages);
+}
+
+function brokerCapabilities(provider, dashboard, spheres, remote) {
+  if (remote) return remote;
+  return {
+    apiVersion: 2, progress: Boolean(dashboard), hints: Boolean(dashboard), activity: false,
+    spheres: Boolean(spheres?.available), multipleFiles: true, browserTrackers: provider !== 'local' || Boolean(activeShare),
+    logicAnalysis: provider === 'local', remoteWake: provider === 'local' ? Boolean(activeShare?.portalConfig?.allowRemoteWake) : provider === 'official',
+  };
+}
+
+function brokerFiles(room, slot) {
+  const shared = room.provider?.type !== 'local' || room.hosted?.sharedSlots?.includes(Number(slot.slot));
+  if (!shared) return [];
+  const source = slot.remoteFiles?.length ? slot.remoteFiles : slot.files || [];
+  return source.map((file) => ({
+    id: String(file.id || file.sourceId || ''), sourceId: String(file.sourceId || file.id || ''), revision: String(file.revision || file.sourceId || file.id || ''),
+    name: String(file.name || 'Room file'), size: Math.max(0, Number(file.size) || 0), kind: String(file.kind || 'downloaded'),
+  }));
+}
+
+async function resolveBrokerRoom(room, options = {}) {
+  const provider = room.provider?.type || 'official';
+  if (provider === 'controller') {
+    const status = await rooms.refreshControllerRoom(net, room.provider.roomUrl || room.url);
+    if (!status.snapshot) throw new Error('This Controller room only exposes the limited v1 API and has no normalized snapshot.');
+    return { status, snapshot: status.snapshot };
+  }
+
+  let status;
+  let rawDashboard;
+  let activity = [];
+  let logic = room.logicAnalyses || {};
+  let spheres = { refreshedAt: new Date().toISOString(), available: false, reason: provider === 'local' ? 'not-running' : 'incompatible', checks: [] };
+  if (provider === 'local') {
+    const running = Boolean(activeHost && activeHost.exitCode === null && activeHostMeta?.roomId === room.id);
+    status = {
+      lastPort: running ? activeHostMeta.port : undefined,
+      endpoint: running ? { host: 'localhost', port: activeHostMeta.port, secure: false } : undefined,
+      refreshedAt: new Date().toISOString(), stale: false,
+    };
+    if (trackerSidecar.running && trackerSidecar.roomId === room.id) rawDashboard = trackerSidecar.snapshot();
+    if (activeShare?.roomId === room.id) {
+      const portal = roomPortal.snapshot();
+      if (portal.tracker) rawDashboard = portal.tracker;
+      if (portal.spheres || activeSphereSnapshot) spheres = portal.spheres || activeSphereSnapshot;
+      activity = Array.isArray(portal.live?.events) ? portal.live.events : [];
+      logic = { ...logic, ...(portal.logic || {}) };
+    }
+  } else {
+    status = await rooms.refreshRoom(net, room.provider?.roomUrl || room.url, Boolean(options.wake));
+    if (status.lastPort && !status.endpoint) status.endpoint = { host: ROOM_HOST, port: status.lastPort, secure: true };
+    rawDashboard = await officialTrackerDashboard(room, status).catch(() => undefined);
+  }
+
+  const refreshedAt = String(rawDashboard?.refreshedAt || status.refreshedAt || new Date().toISOString());
+  const sourceSlots = status.slots?.length ? status.slots : room.slots;
+  const dashboard = sanitizeBrokerDashboard(rawDashboard, sourceSlots, refreshedAt);
+  const players = new Map(dashboard.players.map((player) => [Number(player.slot), player]));
+  const names = new Map(dashboard.players.map((player) => [String(player.name).trim().toLocaleLowerCase(), player]));
+  const normalizedSlots = sourceSlots.map((slot) => {
+    const saved = room.slots.find((candidate) => Number(candidate.slot) === Number(slot.slot) || String(candidate.name).trim().toLocaleLowerCase() === String(slot.name).trim().toLocaleLowerCase()) || slot;
+    const player = players.get(Number(slot.slot)) || names.get(String(slot.name).trim().toLocaleLowerCase());
+    return {
+      slot: Number(slot.slot), name: String(slot.name), game: String(slot.game || saved.game || 'Unknown'),
+      connected: Boolean(player && (/connected|ready|playing|finished|goal/i.test(player.statusLabel) || player.status > 0)), files: brokerFiles(room, saved),
+    };
+  });
+  const capabilities = { ...brokerCapabilities(provider, rawDashboard, spheres), activity: provider === 'local' ? Boolean(activeShare?.roomId === room.id) : false };
+  const revision = createHash('sha256').update(JSON.stringify({ endpoint: status.endpoint, slots: normalizedSlots, dashboard, activity, spheres, logic })).digest('hex');
+  const snapshot = {
+    apiVersion: 2, schemaVersion: ROOM_BROKER_SCHEMA_VERSION, roomId: room.id, label: room.label,
+    generationId: room.provider?.historyRunId || undefined, refreshedAt, stale: false,
+    original: {
+      lifecycle: status.endpoint ? 'Online' : 'Offline', endpoint: status.endpoint, passwordRequired: Boolean(room.passwordRequired),
+      slots: normalizedSlots, observedAt: refreshedAt, sourceRevision: revision,
+    },
+    enriched: {
+      dashboard, hints: dashboard.hints, activity, spheres, logic, capabilities,
+    },
+  };
+  return { status: { ...status, capabilities, snapshot }, snapshot };
+}
+
+async function wakeBrokerRoom(room) {
+  if (!room || room.apiVisible === false) throw Object.assign(new Error('That saved room is not exposed through the Room API.'), { code: 'ROOM_NOT_FOUND', status: 404 });
+  if (room.provider?.type === 'official') {
+    const status = await rooms.refreshRoom(net, room.provider.roomUrl || room.url, true);
+    return { status: status.lastPort ? 'online' : 'failed', endpoint: status.endpoint, refreshedAt: status.refreshedAt };
+  }
+  if (room.provider?.type === 'controller') {
+    const parsed = rooms.parseControllerInvite(room.provider.roomUrl || room.url);
+    const statusResponse = await net.fetch(`${parsed.origin}/api/controller/v2/room/${parsed.id}/status`);
+    if (!statusResponse.ok) throw new Error(`Wake status returned HTTP ${statusResponse.status}.`);
+    const status = await statusResponse.json();
+    if (!status.wakeNonce) return { status: 'disabled' };
+    const response = await net.fetch(`${parsed.origin}/api/controller/v2/room/${parsed.id}/actions/wake`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-controller-wake': status.wakeNonce, origin: parsed.origin }, body: '{}' });
+    return response.json().catch(() => ({ status: response.ok ? 'starting' : 'failed' }));
+  }
+  if (activeHost && activeHost.exitCode === null) return { status: activeHostMeta?.roomId === room.id ? 'online' : 'busy' };
+  if (!room.hosted?.allowRemoteWake || !mainWindow || mainWindow.isDestroyed()) return { status: 'disabled' };
+  mainWindow.webContents.send('rooms:wake-request', { roomId: room.id });
+  return { status: 'starting' };
 }
 
 async function createTrackerWorkspace(payload) {

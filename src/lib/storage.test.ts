@@ -39,6 +39,18 @@ describe('stored host settings', () => {
     expect(settings.hostedSessionsPath).toBe('C:\\games\\archipelago');
   });
 
+  it('migrates the legacy hosted-room API switch to the room broker', () => {
+    const legacySettings = { ...initialState.settings, roomHostApiRemote: true } as typeof initialState.settings & { roomHostApiRemote: boolean };
+    delete (legacySettings as Partial<typeof initialState.settings>).roomDataApiRemote;
+    localStorage.setItem('archipelago-controller-state-v1', JSON.stringify({ ...initialState, settings: legacySettings }));
+
+    const settings = loadState().settings;
+    expect(settings.roomDataApiRemote).toBe(true);
+    expect(settings.roomDataApiEnabled).toBe(true);
+    expect(settings.roomDataApiPort).toBe(38283);
+    expect('roomHostApiRemote' in settings).toBe(false);
+  });
+
   it('removes legacy room access-token metadata', () => {
     localStorage.setItem('archipelago-controller-state-v1', JSON.stringify({
       ...initialState,

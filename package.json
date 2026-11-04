@@ -1,6 +1,6 @@
 {
   "name": "archipelago-controller",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "private": true,
   "description": "A desktop session builder and host controller for Archipelago.",
