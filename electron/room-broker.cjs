@@ -58,6 +58,26 @@ function sanitizeRoom(room) {
   };
 }
 
+function trackerLinks(room, record) {
+  const capabilities = record?.snapshot?.enriched?.capabilities;
+  if (room.provider.type === 'official') {
+    const trackerId = String(record?.status?.trackerId || '');
+    try {
+      const source = new URL(room.provider.roomUrl || room.url);
+      if (source.protocol === 'https:' && source.hostname.toLowerCase() === 'archipelago.gg' && /^[A-Za-z0-9_-]{6,100}$/.test(trackerId)) return {
+        provider: 'official', multiworld: `${source.origin}/tracker/${trackerId}`,
+        spheres: `${source.origin}/sphere_tracker/${trackerId}`, machineReadableSpheres: Boolean(capabilities?.spheres),
+      };
+    } catch { /* Invalid saved URLs do not become external links. */ }
+  }
+  if (room.provider.type === 'controller' && room.provider.roomUrl) return {
+    provider: 'controller', multiworld: `${room.provider.roomUrl}#progress`,
+    spheres: capabilities?.spheres ? `${room.provider.roomUrl}#spheres` : null,
+    machineReadableSpheres: Boolean(capabilities?.spheres),
+  };
+  return { provider: room.provider.type, multiworld: null, spheres: null, machineReadableSpheres: Boolean(capabilities?.spheres) };
+}
+
 function openApi(port = DEFAULT_PORT) {
   return `openapi: 3.1.0
 info:
@@ -100,6 +120,11 @@ paths:
       summary: Read checked sphere data
       parameters: [ { $ref: '#/components/parameters/roomId' } ]
       responses: { '200': { description: Sphere snapshot } }
+  /rooms/{roomId}/trackers:
+    get:
+      summary: Read provider browser tracker links
+      parameters: [ { $ref: '#/components/parameters/roomId' } ]
+      responses: { '200': { description: Multiworld and sphere tracker links } }
   /rooms/{roomId}/actions/refresh:
     post:
       summary: Force a provider refresh
@@ -199,6 +224,7 @@ function createRoomBroker({ app, resolveRoom, wakeRoom, getSecret }) {
       checksDone: dashboard?.checksDone ?? 0, checksTotal: dashboard?.checksTotal ?? 0,
       completedPlayers: dashboard?.completedPlayers ?? 0, unresolvedHints: dashboard?.unresolvedHints ?? 0,
       capabilities: snapshot?.enriched?.capabilities || room.provider.capabilities || { apiVersion: 2, progress: false, hints: false, activity: false, spheres: false, multipleFiles: false, browserTrackers: false, logicAnalysis: false, remoteWake: false },
+      trackers: trackerLinks(room, record),
       error: record?.error,
     };
   }
@@ -250,7 +276,7 @@ function createRoomBroker({ app, resolveRoom, wakeRoom, getSecret }) {
         for (const room of visible) if (!isFresh(records.get(room.id))) void refresh(room.id).catch(() => {});
         return send(request, response, 200, { apiVersion: 2, rooms: visible.map((room) => summary(room)), refreshedAt: now() });
       }
-      const match = url.pathname.match(/^\/api\/controller\/v2\/rooms\/([^/]+)(?:\/(snapshot|dashboard|hints|activity|spheres))?$/);
+      const match = url.pathname.match(/^\/api\/controller\/v2\/rooms\/([^/]+)(?:\/(snapshot|dashboard|hints|activity|spheres|trackers))?$/);
       if (method === 'GET' && match) {
         const id = decodeURIComponent(match[1]);
         const room = rooms.get(id);
@@ -261,7 +287,7 @@ function createRoomBroker({ app, resolveRoom, wakeRoom, getSecret }) {
         }
         const record = await refresh(id);
         const snapshot = record.snapshot;
-        const value = match[2] === 'snapshot' ? snapshot : match[2] === 'dashboard' ? snapshot.enriched.dashboard : match[2] === 'hints' ? snapshot.enriched.hints : match[2] === 'activity' ? snapshot.enriched.activity : snapshot.enriched.spheres;
+        const value = match[2] === 'snapshot' ? snapshot : match[2] === 'dashboard' ? snapshot.enriched.dashboard : match[2] === 'hints' ? snapshot.enriched.hints : match[2] === 'activity' ? snapshot.enriched.activity : match[2] === 'trackers' ? trackerLinks(room, record) : snapshot.enriched.spheres;
         return send(request, response, 200, value);
       }
       const action = url.pathname.match(/^\/api\/controller\/v2\/rooms\/([^/]+)\/actions\/(refresh|wake)$/);

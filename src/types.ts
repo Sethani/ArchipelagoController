@@ -373,7 +373,15 @@ export type RoomBrokerSummary = {
   completedPlayers: number;
   unresolvedHints: number;
   capabilities: RoomProviderCapabilities;
+  trackers?: RoomTrackerLinks;
   error?: string;
+};
+
+export type RoomTrackerLinks = {
+  provider: RoomProviderType;
+  multiworld: string | null;
+  spheres: string | null;
+  machineReadableSpheres: boolean;
 };
 
 export type RoomBrokerState = {

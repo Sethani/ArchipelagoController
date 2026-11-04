@@ -21,6 +21,7 @@ const { inventoryMinecraftLauncher } = require('./minecraft-launcher.cjs');
 const { parseUniversalTrackerOutput } = require('./universal-tracker.cjs');
 const { createTrackerSidecar } = require('./tracker-sidecar.cjs');
 const { archiveMultidata, checkedSphereSnapshot, completeSphereSnapshot } = require('./multidata-spheres.cjs');
+const { parseOfficialSphereHtml } = require('./official-spheres.cjs');
 const YAML = require('yaml');
 
 const isDev = process.argv.includes('--dev');
@@ -871,7 +872,16 @@ async function officialTrackerDashboard(room, status) {
     try { packages[game] = await trackerPackageCache.get(checksum); }
     catch (error) { trackerPackageCache.delete(checksum); throw error; }
   }));
-  return rooms.normalizeTrackerDashboard(dynamic, fixed, room.slots, packages);
+  return { dashboard: rooms.normalizeTrackerDashboard(dynamic, fixed, room.slots, packages), packages };
+}
+
+async function officialSphereSnapshot(room, status, dashboard, packages) {
+  const trackerId = String(status?.trackerId || '');
+  if (!/^[A-Za-z0-9_-]{6,100}$/.test(trackerId)) return { refreshedAt: new Date().toISOString(), available: false, reason: 'absent', checks: [] };
+  const parsed = rooms.parseRoomUrl(room.provider?.roomUrl || room.url);
+  const response = await net.fetch(`${parsed.origin}/sphere_tracker/${trackerId}`, { method: 'GET' });
+  if (!response.ok) return { refreshedAt: new Date().toISOString(), available: false, reason: 'incompatible', checks: [] };
+  return parseOfficialSphereHtml(await response.text(), dashboard, packages);
 }
 
 function brokerCapabilities(provider, dashboard, spheres, remote) {
@@ -924,7 +934,9 @@ async function resolveBrokerRoom(room, options = {}) {
   } else {
     status = await rooms.refreshRoom(net, room.provider?.roomUrl || room.url, Boolean(options.wake));
     if (status.lastPort && !status.endpoint) status.endpoint = { host: ROOM_HOST, port: status.lastPort, secure: true };
-    rawDashboard = await officialTrackerDashboard(room, status).catch(() => undefined);
+    const tracked = await officialTrackerDashboard(room, status).catch(() => undefined);
+    rawDashboard = tracked?.dashboard;
+    if (tracked) spheres = await officialSphereSnapshot(room, status, tracked.dashboard, tracked.packages).catch(() => ({ refreshedAt: new Date().toISOString(), available: false, reason: 'malformed', checks: [] }));
   }
 
   const refreshedAt = String(rawDashboard?.refreshedAt || status.refreshedAt || new Date().toISOString());

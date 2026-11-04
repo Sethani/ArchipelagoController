@@ -53,7 +53,7 @@ describe('room broker contract', () => {
       app: { getPath: () => root }, getSecret: async () => 'test-key',
       wakeRoom: async () => { wakes += 1; return { status: 'starting' }; },
       resolveRoom: async (room: Record<string, any>) => ({
-        status: { refreshedAt: new Date().toISOString(), stale: false },
+        status: { refreshedAt: new Date().toISOString(), stale: false, trackerId: room.provider?.type === 'official' ? 'tracker-test-id' : undefined },
         snapshot: {
           apiVersion: 2, schemaVersion: '2.1.0', roomId: room.id, label: room.label,
           refreshedAt: new Date().toISOString(), stale: false,
@@ -67,7 +67,10 @@ describe('room broker contract', () => {
       }),
     });
     try {
-      await broker.sync({ rooms: [{ id: 'saved-room', label: 'Saved Room', provider: { type: 'local' }, slots: [] }], settings: { enabled: true, port, remoteEnabled: false, allowedOrigins: [], secretRef: 'key' } });
+      await broker.sync({ rooms: [
+        { id: 'saved-room', label: 'Saved Room', provider: { type: 'local' }, slots: [] },
+        { id: 'official-room', label: 'Official Room', url: 'https://archipelago.gg/room/official-room', provider: { type: 'official', roomUrl: 'https://archipelago.gg/room/official-room' }, slots: [] },
+      ], settings: { enabled: true, port, remoteEnabled: false, allowedOrigins: [], secretRef: 'key' } });
       const list = await fetch(`http://127.0.0.1:${port}/api/controller/v2/rooms`);
       expect(list.status).toBe(200);
       expect((await list.json()).rooms[0].id).toBe('saved-room');
@@ -76,6 +79,11 @@ describe('room broker contract', () => {
       const etag = first.headers.get('etag')!;
       const unchanged = await fetch(`http://127.0.0.1:${port}/api/controller/v2/rooms/saved-room/snapshot`, { headers: { 'if-none-match': etag } });
       expect(unchanged.status).toBe(304);
+      const trackers = await fetch(`http://127.0.0.1:${port}/api/controller/v2/rooms/official-room/trackers`);
+      expect(await trackers.json()).toEqual({
+        provider: 'official', multiworld: 'https://archipelago.gg/tracker/tracker-test-id',
+        spheres: 'https://archipelago.gg/sphere_tracker/tracker-test-id', machineReadableSpheres: false,
+      });
       expect((await fetch(`http://127.0.0.1:${port}/api/controller/v2/rooms/saved-room/actions/wake`, { method: 'POST' })).status).toBe(401);
       const wake = await fetch(`http://127.0.0.1:${port}/api/controller/v2/rooms/saved-room/actions/wake`, { method: 'POST', headers: { authorization: 'Bearer test-key' } });
       expect(wake.status).toBe(200);
