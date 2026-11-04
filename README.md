@@ -49,6 +49,8 @@ http://127.0.0.1:38283/api/controller/v2/rooms
 
 This works for official Archipelago rooms, locally hosted rooms, and remote Controller rooms. Individual snapshots are available at `/rooms/<managed-room-id>/snapshot`, and the live OpenAPI contract is served at `/openapi.yaml`. Local read requests need no key; refresh/wake actions and optional network access use the bearer key configured under **Settings → Room data API**.
 
+Capability flags describe data available through the broker API. For example, an official room may have `activity: false` because Archipelago.gg does not expose an event-history feed, and `spheres: false` when its browser sphere tracker has no machine-readable feed available to Controller.
+
 ## Verification
 
 ```powershell

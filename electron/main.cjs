@@ -879,7 +879,7 @@ function brokerCapabilities(provider, dashboard, spheres, remote) {
   return {
     apiVersion: 2, progress: Boolean(dashboard), hints: Boolean(dashboard), activity: false,
     spheres: Boolean(spheres?.available), multipleFiles: true, browserTrackers: provider !== 'local' || Boolean(activeShare),
-    logicAnalysis: provider === 'local', remoteWake: provider === 'local' ? Boolean(activeShare?.portalConfig?.allowRemoteWake) : provider === 'official',
+    logicAnalysis: true, remoteWake: provider === 'local' ? Boolean(activeShare?.portalConfig?.allowRemoteWake) : provider === 'official',
   };
 }
 
